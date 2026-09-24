@@ -661,7 +661,7 @@ public class MainActivity extends Activity {
         lastLinkText.setText(name.isEmpty() ? url : name + "\n" + url);
         copyButton.setEnabled(true);
         shareButton.setEnabled(true);
-        copyReplacedButton.setEnabled(!remoteBaseInput.getText().toString().trim().isEmpty());
+        copyReplacedButton.setEnabled(true);
     }
 
     private void refreshHistory() {
