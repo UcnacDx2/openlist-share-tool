@@ -875,10 +875,9 @@ public class UploadService extends Service {
         // The multipart engine follows the current OpenList frontend protocol:
         // bounded ascending concurrency, flow-control retries, resumable
         // session probing, and an explicit backend-completion phase.
-        // chunkParallel is intentionally ignored here because the proven
-        // protocol uses three in-flight chunks per file; the user-facing
-        // setting remains the global tuning knob for the file uploader below
-        // and legacy paths.
+        // OpenList's reference frontend uses a small bounded in-flight
+        // window. Keep the setting configurable, while the uploader itself
+        // clamps it to a safe range.
         MultipartUploader uploader =
                 new MultipartUploader(this);
 
@@ -892,6 +891,7 @@ public class UploadService extends Service {
                 overwrite,
                 size,
                 initialChunkSize,
+                chunkParallel,
                 (uploadedBytes, progress, detail) ->
                         updateProgress(
                                 index,
