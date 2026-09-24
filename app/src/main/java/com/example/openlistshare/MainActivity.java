@@ -32,6 +32,7 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
+import java.net.URI;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -53,6 +54,7 @@ public class MainActivity extends Activity {
     public static final String KEY_FILE_PARALLEL = "file_parallel";
     public static final String KEY_LARGE_FILE_THRESHOLD_MB = "large_file_threshold_mb";
     public static final String KEY_UPLOAD_PROGRESS = "upload_progress";
+    public static final String KEY_REMOTE_BASE = "remote_base_url";
     public static final String EXTRA_URIS = "uris";
 
     private static final int REQUEST_POST_NOTIFICATIONS = 1001;
@@ -75,6 +77,8 @@ public class MainActivity extends Activity {
     private Button testButton;
     private Button copyButton;
     private Button shareButton;
+    private EditText remoteBaseInput;
+    private Button copyReplacedButton;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final List<Uri> pendingUris = new ArrayList<>();
@@ -230,6 +234,15 @@ public class MainActivity extends Activity {
         shareButton.setEnabled(false);
         root.addView(shareButton, matchWrap());
 
+        root.addView(label("远端访问地址（仅替换域名/端口）"));
+        remoteBaseInput = input("https://example.com:8443");
+        root.addView(remoteBaseInput, matchWrap());
+
+        copyReplacedButton = new Button(this);
+        copyReplacedButton.setText("替换为远端地址并复制");
+        copyReplacedButton.setEnabled(false);
+        root.addView(copyReplacedButton, matchWrap());
+
         root.addView(label("上传历史"));
         historyText = new TextView(this);
         historyText.setText("暂无上传历史");
@@ -242,6 +255,7 @@ public class MainActivity extends Activity {
         uploadButton.setOnClickListener(v -> startUploadService(false));
         copyButton.setOnClickListener(v -> copyLastUrl());
         shareButton.setOnClickListener(v -> shareLastUrl());
+        copyReplacedButton.setOnClickListener(v -> copyReplacedLastUrl());
     }
 
     private TextView label(String text) {
@@ -304,6 +318,7 @@ public class MainActivity extends Activity {
         fileParallelInput.setText(Integer.toString(p.getInt(KEY_FILE_PARALLEL, 2)));
         largeFileThresholdInput.setText(Integer.toString(storedThreshold));
         overwriteBox.setChecked(p.getBoolean(KEY_OVERWRITE, false));
+        remoteBaseInput.setText(p.getString(KEY_REMOTE_BASE, ""));
         refreshLastLink();
         refreshHistory();
     }
@@ -328,6 +343,7 @@ public class MainActivity extends Activity {
                 .putInt(KEY_FILE_PARALLEL, fileParallel)
                 .putInt(KEY_LARGE_FILE_THRESHOLD_MB, thresholdMb)
                 .putBoolean(KEY_OVERWRITE, overwriteBox.isChecked())
+                .putString(KEY_REMOTE_BASE, remoteBaseInput.getText().toString().trim())
                 .apply();
 
         return true;
@@ -638,12 +654,14 @@ public class MainActivity extends Activity {
             lastLinkText.setText("暂无");
             copyButton.setEnabled(false);
             shareButton.setEnabled(false);
+            copyReplacedButton.setEnabled(false);
             return;
         }
 
         lastLinkText.setText(name.isEmpty() ? url : name + "\n" + url);
         copyButton.setEnabled(true);
         shareButton.setEnabled(true);
+        copyReplacedButton.setEnabled(!remoteBaseInput.getText().toString().trim().isEmpty());
     }
 
     private void refreshHistory() {
@@ -709,6 +727,73 @@ public class MainActivity extends Activity {
         intent.setType("text/plain");
         intent.putExtra(Intent.EXTRA_TEXT, url);
         startActivity(Intent.createChooser(intent, "分享 OpenList 直链"));
+    }
+
+    private void copyReplacedLastUrl() {
+        String url = getLastUrl();
+        String remoteBase = remoteBaseInput.getText().toString().trim();
+
+        if (url.isEmpty()) {
+            Toast.makeText(this, "暂无直链", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (remoteBase.isEmpty()) {
+            Toast.makeText(this, "请先填写远端访问地址", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        try {
+            URI source = new URI(url);
+            URI remote = new URI(normalizedBase(remoteBase));
+
+            if (source.getScheme() == null || source.getHost() == null) {
+                throw new IllegalArgumentException("最近一次直链不是标准 HTTP 地址");
+            }
+
+            if (remote.getScheme() == null || remote.getHost() == null ||
+                    (!"http".equalsIgnoreCase(remote.getScheme()) &&
+                            !"https".equalsIgnoreCase(remote.getScheme()))) {
+                throw new IllegalArgumentException("远端地址必须是 http:// 或 https://");
+            }
+
+            String replaced = new URI(
+                    remote.getScheme(),
+                    remote.getUserInfo(),
+                    remote.getHost(),
+                    remote.getPort(),
+                    source.getPath(),
+                    source.getQuery(),
+                    source.getFragment()
+            ).toString();
+
+            ClipboardManager clipboard =
+                    (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (clipboard != null) {
+                clipboard.setPrimaryClip(
+                        ClipData.newPlainText("OpenList 远端直链", replaced)
+                );
+                Toast.makeText(this, "远端直链已复制", Toast.LENGTH_SHORT).show();
+                statusText.setText("已替换域名/端口并复制：\n" + replaced);
+            }
+        } catch (Exception e) {
+            Toast.makeText(
+                    this,
+                    "远端地址无效：" + e.getMessage(),
+                    Toast.LENGTH_SHORT
+            ).show();
+        }
+    }
+
+    private String normalizedBase(String value) {
+        String s = value == null ? "" : value.trim();
+        while (s.endsWith("/")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        if (!s.contains("://")) {
+            s = "https://" + s;
+        }
+        return s;
     }
 
     private String getLastUrl() {
