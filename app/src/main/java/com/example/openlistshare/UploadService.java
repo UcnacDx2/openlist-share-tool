@@ -597,16 +597,25 @@ public class UploadService extends Service {
             int httpCode = conn.getResponseCode();
             String body = readBody(conn);
 
-            JSONObject json = body.isEmpty()
-                    ? new JSONObject()
-                    : new JSONObject(body);
-
             if (httpCode < 200 || httpCode >= 300) {
                 throw new IOException(
                         "OpenList 分片初始化 HTTP " +
                                 httpCode +
                                 "：" +
                                 safeMessage(body)
+                );
+            }
+
+            JSONObject json;
+            try {
+                json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+            } catch (Exception e) {
+                throw new IOException(
+                        "OpenList 分片初始化返回非 JSON HTTP " +
+                                httpCode +
+                                "：" +
+                                safeMessage(body),
+                        e
                 );
             }
 
@@ -696,10 +705,6 @@ public class UploadService extends Service {
             int httpCode = conn.getResponseCode();
             String body = readBody(conn);
 
-            JSONObject json = body.isEmpty()
-                    ? new JSONObject()
-                    : new JSONObject(body);
-
             if (httpCode < 200 || httpCode >= 300) {
                 throw new IOException(
                         "OpenList 分片 " +
@@ -708,6 +713,21 @@ public class UploadService extends Service {
                                 httpCode +
                                 "：" +
                                 safeMessage(body)
+                );
+            }
+
+            JSONObject json;
+            try {
+                json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+            } catch (Exception e) {
+                throw new IOException(
+                        "OpenList 分片 " +
+                                (chunkIndex + 1) +
+                                " 返回非 JSON HTTP " +
+                                httpCode +
+                                "：" +
+                                safeMessage(body),
+                        e
                 );
             }
 
@@ -751,16 +771,25 @@ public class UploadService extends Service {
             int httpCode = conn.getResponseCode();
             String body = readBody(conn);
 
-            JSONObject json = body.isEmpty()
-                    ? new JSONObject()
-                    : new JSONObject(body);
-
             if (httpCode < 200 || httpCode >= 300) {
                 throw new IOException(
                         "OpenList 分片完成 HTTP " +
                                 httpCode +
                                 "：" +
                                 safeMessage(body)
+                );
+            }
+
+            JSONObject json;
+            try {
+                json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+            } catch (Exception e) {
+                throw new IOException(
+                        "OpenList 分片完成返回非 JSON HTTP " +
+                                httpCode +
+                                "：" +
+                                safeMessage(body),
+                        e
                 );
             }
 
