@@ -37,6 +37,9 @@ public class UploadService extends Service {
     private static final String CHANNEL_ID = "openlist_uploads";
     private static final int NOTIFICATION_ID = 20260924;
     private static final int PAGE_SIZE = 1000;
+    private static final int LARGE_FILE_THRESHOLD = 8 * 1024 * 1024;
+    private static final int REQUESTED_CHUNK_SIZE = 8 * 1024 * 1024;
+    private static final int CHUNK_RETRIES = 3;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
@@ -127,17 +130,31 @@ public class UploadService extends Service {
                 updateProgress(index, total, finalName, 0);
 
                 stage = "上传文件";
-                uploadOne(
-                        base,
-                        token,
-                        uri,
-                        target,
-                        overwrite,
-                        size,
-                        index,
-                        total,
-                        finalName
-                );
+                if (size > LARGE_FILE_THRESHOLD) {
+                    multipartUpload(
+                            base,
+                            token,
+                            uri,
+                            target,
+                            overwrite,
+                            size,
+                            index,
+                            total,
+                            finalName
+                    );
+                } else {
+                    uploadOne(
+                            base,
+                            token,
+                            uri,
+                            target,
+                            overwrite,
+                            size,
+                            index,
+                            total,
+                            finalName
+                    );
+                }
 
                 stage = "生成 OpenList 302 直链";
                 String directUrl = getOpenList302Url(base, token, target);
@@ -361,6 +378,437 @@ public class UploadService extends Service {
         } finally {
             if (conn != null) conn.disconnect();
         }
+    }
+
+    private void multipartUpload(
+            String base,
+            String token,
+            Uri uri,
+            String target,
+            boolean overwrite,
+            long size,
+            int index,
+            int total,
+            String displayName
+    ) throws Exception {
+        if (size <= 0) {
+            throw new IOException("分片上传要求文件大小大于 0");
+        }
+
+        updateProgress(index, total, displayName, 0);
+
+        JSONObject init = new JSONObject();
+        JSONObject initData = multipartInit(
+                base,
+                token,
+                target,
+                overwrite,
+                size
+        );
+
+        String uploadId = initData.optString("upload_id", "");
+        if (uploadId.isEmpty()) {
+            throw new IOException("OpenList 分片初始化未返回 upload_id");
+        }
+
+        long chunkSize = initData.optLong("chunk_size", REQUESTED_CHUNK_SIZE);
+        if (chunkSize <= 0) {
+            throw new IOException("OpenList 返回了无效的分片大小：" + chunkSize);
+        }
+
+        int totalChunks = initData.optInt(
+                "total_chunks",
+                (int) ((size + chunkSize - 1) / chunkSize)
+        );
+
+        byte[] buffer = new byte[(int) Math.min(chunkSize, Integer.MAX_VALUE)];
+        long uploadedBefore = 0;
+        int completedChunks = 0;
+
+        try (InputStream raw = getContentResolver().openInputStream(uri)) {
+            if (raw == null) {
+                throw new IOException("无法读取文件");
+            }
+
+            InputStream in = new BufferedInputStream(raw, 128 * 1024);
+
+            for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+                int expected = (int) Math.min(
+                        chunkSize,
+                        size - uploadedBefore
+                );
+
+                int actual = readChunk(in, buffer, expected);
+                if (actual != expected) {
+                    throw new IOException(
+                            "文件读取不完整：第 " +
+                                    (chunkIndex + 1) +
+                                    "/" +
+                                    totalChunks +
+                                    " 片，期望 " +
+                                    expected +
+                                    " 字节，实际 " +
+                                    actual +
+                                    " 字节"
+                    );
+                }
+
+                long chunkStart = uploadedBefore;
+                Exception lastError = null;
+                boolean success = false;
+
+                for (int attempt = 1; attempt <= CHUNK_RETRIES; attempt++) {
+                    try {
+                        multipartChunk(
+                                base,
+                                token,
+                                uploadId,
+                                chunkIndex,
+                                buffer,
+                                actual,
+                                index,
+                                total,
+                                displayName,
+                                chunkStart,
+                                size
+                        );
+                        success = true;
+                        break;
+                    } catch (Exception e) {
+                        lastError = e;
+                        updateProgress(
+                                index,
+                                total,
+                                displayName +
+                                        " · 第 " +
+                                        (chunkIndex + 1) +
+                                        "/" +
+                                        totalChunks +
+                                        " 片重试 " +
+                                        attempt +
+                                        "/" +
+                                        CHUNK_RETRIES,
+                                (int) Math.min(
+                                        100L,
+                                        (chunkStart * 100L) / size
+                                )
+                        );
+
+                        if (attempt < CHUNK_RETRIES) {
+                            try {
+                                Thread.sleep(1000L);
+                            } catch (InterruptedException interrupted) {
+                                Thread.currentThread().interrupt();
+                                throw new IOException("上传被中断", interrupted);
+                            }
+                        }
+                    }
+                }
+
+                if (!success) {
+                    throw new IOException(
+                            "第 " +
+                                    (chunkIndex + 1) +
+                                    "/" +
+                                    totalChunks +
+                                    " 片上传失败：" +
+                                    friendlyError(lastError)
+                    );
+                }
+
+                uploadedBefore += actual;
+                completedChunks++;
+
+                int progress = (int) Math.min(
+                        100L,
+                        uploadedBefore * 100L / size
+                );
+
+                updateProgress(
+                        index,
+                        total,
+                        displayName +
+                                " · 分片 " +
+                                completedChunks +
+                                "/" +
+                                totalChunks,
+                        progress
+                );
+            }
+        }
+
+        JSONObject complete = multipartComplete(
+                base,
+                token,
+                uploadId
+        );
+
+        String state = complete.optString("state", "");
+        if (!"completed".equals(state)) {
+            String error = complete.optString("error", "");
+            if (error.isEmpty()) {
+                error = "OpenList 返回状态：" + state;
+            }
+            throw new IOException("分片合并失败：" + error);
+        }
+
+        updateProgress(
+                index,
+                total,
+                displayName,
+                100
+        );
+    }
+
+    private JSONObject multipartInit(
+            String base,
+            String token,
+            String target,
+            boolean overwrite,
+            long size
+    ) throws Exception {
+        HttpURLConnection conn = null;
+
+        try {
+            URL url = new URL(base + "/api/fs/multipart/init");
+            conn = (HttpURLConnection) url.openConnection();
+
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(20000);
+            conn.setDoInput(true);
+
+            conn.setRequestProperty("Authorization", token);
+            conn.setRequestProperty("File-Path", Uri.encode(target, "/"));
+            conn.setRequestProperty("X-File-Size", Long.toString(size));
+            conn.setRequestProperty(
+                    "X-Chunk-Size",
+                    Integer.toString(REQUESTED_CHUNK_SIZE)
+            );
+            conn.setRequestProperty(
+                    "Overwrite",
+                    overwrite ? "true" : "false"
+            );
+            conn.setRequestProperty(
+                    "Content-Type",
+                    "application/octet-stream"
+            );
+
+            int httpCode = conn.getResponseCode();
+            String body = readBody(conn);
+
+            JSONObject json = body.isEmpty()
+                    ? new JSONObject()
+                    : new JSONObject(body);
+
+            if (httpCode < 200 || httpCode >= 300) {
+                throw new IOException(
+                        "OpenList 分片初始化 HTTP " +
+                                httpCode +
+                                "：" +
+                                safeMessage(body)
+                );
+            }
+
+            int code = json.optInt("code", httpCode);
+            if (code != 200) {
+                throw new IOException(
+                        "OpenList 分片初始化失败 " +
+                                code +
+                                "：" +
+                                json.optString("message", body)
+                );
+            }
+
+            JSONObject data = json.optJSONObject("data");
+            if (data == null) {
+                throw new IOException("OpenList 分片初始化没有 data");
+            }
+
+            return data;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private void multipartChunk(
+            String base,
+            String token,
+            String uploadId,
+            int chunkIndex,
+            byte[] buffer,
+            int length,
+            int fileIndex,
+            int totalFiles,
+            String displayName,
+            long overallOffset,
+            long totalSize
+    ) throws Exception {
+        HttpURLConnection conn = null;
+
+        try {
+            URL url = new URL(base + "/api/fs/multipart/chunk");
+            conn = (HttpURLConnection) url.openConnection();
+
+            conn.setRequestMethod("PUT");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(0);
+            conn.setDoOutput(true);
+
+            conn.setRequestProperty("Authorization", token);
+            conn.setRequestProperty("X-Upload-Id", uploadId);
+            conn.setRequestProperty("X-Chunk-Index", Integer.toString(chunkIndex));
+            conn.setRequestProperty("Content-Type", "application/octet-stream");
+            conn.setFixedLengthStreamingMode(length);
+
+            try (OutputStream out = conn.getOutputStream()) {
+                int offset = 0;
+                final int step = 64 * 1024;
+                long lastUpdate = System.currentTimeMillis();
+
+                while (offset < length) {
+                    int n = Math.min(step, length - offset);
+                    out.write(buffer, offset, n);
+                    offset += n;
+
+                    long now = System.currentTimeMillis();
+                    if (now - lastUpdate >= 250 || offset == length) {
+                        long uploaded = overallOffset + offset;
+                        int progress = (int) Math.min(
+                                100L,
+                                uploaded * 100L / totalSize
+                        );
+                        updateProgress(
+                                fileIndex,
+                                totalFiles,
+                                displayName +
+                                        " · 分片 " +
+                                        (chunkIndex + 1),
+                                progress
+                        );
+                        lastUpdate = now;
+                    }
+                }
+            }
+
+            int httpCode = conn.getResponseCode();
+            String body = readBody(conn);
+
+            JSONObject json = body.isEmpty()
+                    ? new JSONObject()
+                    : new JSONObject(body);
+
+            if (httpCode < 200 || httpCode >= 300) {
+                throw new IOException(
+                        "OpenList 分片 " +
+                                (chunkIndex + 1) +
+                                " HTTP " +
+                                httpCode +
+                                "：" +
+                                safeMessage(body)
+                );
+            }
+
+            int code = json.optInt("code", httpCode);
+            if (code != 200) {
+                throw new IOException(
+                        "OpenList 分片 " +
+                                (chunkIndex + 1) +
+                                " 失败 " +
+                                code +
+                                "：" +
+                                json.optString("message", body)
+                );
+            }
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private JSONObject multipartComplete(
+            String base,
+            String token,
+            String uploadId
+    ) throws Exception {
+        HttpURLConnection conn = null;
+
+        try {
+            URL url = new URL(base + "/api/fs/multipart/complete");
+            conn = (HttpURLConnection) url.openConnection();
+
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(0);
+            conn.setDoInput(true);
+
+            conn.setRequestProperty("Authorization", token);
+            conn.setRequestProperty("X-Upload-Id", uploadId);
+
+            int httpCode = conn.getResponseCode();
+            String body = readBody(conn);
+
+            JSONObject json = body.isEmpty()
+                    ? new JSONObject()
+                    : new JSONObject(body);
+
+            if (httpCode < 200 || httpCode >= 300) {
+                throw new IOException(
+                        "OpenList 分片完成 HTTP " +
+                                httpCode +
+                                "：" +
+                                safeMessage(body)
+                );
+            }
+
+            int code = json.optInt("code", httpCode);
+            if (code != 200) {
+                throw new IOException(
+                        "OpenList 分片完成失败 " +
+                                code +
+                                "：" +
+                                json.optString("message", body)
+                );
+            }
+
+            JSONObject data = json.optJSONObject("data");
+            if (data == null) {
+                throw new IOException("OpenList 分片完成没有 data");
+            }
+
+            return data;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private int readChunk(InputStream in, byte[] buffer, int expected)
+            throws IOException {
+        int total = 0;
+
+        while (total < expected) {
+            int n = in.read(buffer, total, expected - total);
+
+            if (n == -1) {
+                break;
+            }
+
+            if (n == 0) {
+                int one = in.read();
+                if (one == -1) break;
+                buffer[total++] = (byte) one;
+                continue;
+            }
+
+            total += n;
+        }
+
+        return total;
     }
 
     private String getOpenList302Url(
