@@ -27,28 +27,33 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.CompletionService;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class UploadService extends Service {
     private static final String CHANNEL_ID = "openlist_uploads";
     private static final int NOTIFICATION_ID = 20260924;
     private static final int PAGE_SIZE = 1000;
-    private static final int LARGE_FILE_THRESHOLD = 8 * 1024 * 1024;
-    // 8 MiB is below OpenList's default 10 MiB multipart ceiling while
-    // greatly reducing HTTP request overhead versus 1 MiB chunks.
-    private static final int REQUESTED_CHUNK_SIZE = 8 * 1024 * 1024;
+    private static final int DEFAULT_LARGE_FILE_THRESHOLD_MB = 8;
+    private static final int DEFAULT_CHUNK_SIZE_MB = 8;
+    private static final int DEFAULT_CHUNK_PARALLEL = 4;
+    private static final int DEFAULT_FILE_PARALLEL = 2;
+    private static final int MAX_CHUNK_SIZE_MB = 64;
+    private static final int MAX_CHUNK_PARALLEL = 8;
+    private static final int MAX_FILE_PARALLEL = 4;
     private static final int CHUNK_RETRIES = 3;
-    // OpenList currently accepts concurrent/out-of-order chunks within an
-    // 8-slot receive window. Four workers leave headroom for retries/control.
-    private static final int MAX_PARALLEL_CHUNKS = 4;
+    private static final int PROGRESS_WRITE_SIZE = 128 * 1024;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
@@ -104,186 +109,344 @@ public class UploadService extends Service {
     }
 
     private void uploadAll(List<Uri> uris) {
-        SharedPreferences prefs = getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+        SharedPreferences prefs =
+                getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
 
-        String base = normalizeBase(prefs.getString(MainActivity.KEY_BASE, ""));
-        String token = prefs.getString(MainActivity.KEY_TOKEN, "").trim();
-        String dir = normalizeDir(prefs.getString(MainActivity.KEY_DIR, "/uploads"));
-        boolean overwrite = prefs.getBoolean(MainActivity.KEY_OVERWRITE, false);
+        String base = normalizeBase(
+                prefs.getString(MainActivity.KEY_BASE, "")
+        );
+        String token =
+                prefs.getString(MainActivity.KEY_TOKEN, "").trim();
+        String dir = normalizeDir(
+                prefs.getString(MainActivity.KEY_DIR, "/uploads")
+        );
+        boolean overwrite = prefs.getBoolean(
+                MainActivity.KEY_OVERWRITE,
+                false
+        );
+
+        int chunkSizeMb = clampInt(
+                prefs.getInt(
+                        MainActivity.KEY_CHUNK_SIZE_MB,
+                        DEFAULT_CHUNK_SIZE_MB
+                ),
+                1,
+                MAX_CHUNK_SIZE_MB
+        );
+        int chunkParallel = clampInt(
+                prefs.getInt(
+                        MainActivity.KEY_CHUNK_PARALLEL,
+                        DEFAULT_CHUNK_PARALLEL
+                ),
+                1,
+                MAX_CHUNK_PARALLEL
+        );
+        int fileParallel = clampInt(
+                prefs.getInt(
+                        MainActivity.KEY_FILE_PARALLEL,
+                        DEFAULT_FILE_PARALLEL
+                ),
+                1,
+                MAX_FILE_PARALLEL
+        );
+        int thresholdMb = clampInt(
+                prefs.getInt(
+                        MainActivity.KEY_LARGE_FILE_THRESHOLD_MB,
+                        DEFAULT_LARGE_FILE_THRESHOLD_MB
+                ),
+                1,
+                1024
+        );
+
+        long chunkSize = chunkSizeMb * 1024L * 1024L;
+        long largeFileThreshold =
+                thresholdMb * 1024L * 1024L;
 
         if (base.isEmpty() || token.isEmpty()) {
             finishWithError("请先配置 OpenList 地址和 Token");
             return;
         }
 
-        int total = uris.size();
+        initializeProgress(uris);
 
-        for (int index = 0; index < total; index++) {
-            Uri uri = uris.get(index);
-            String originalName = sanitizeFileName(displayName(uri));
-            long size = sizeOf(uri);
-            String finalName = originalName;
-            String stage = "准备";
+        Set<String> reservedTargets =
+                Collections.synchronizedSet(new HashSet<>());
 
-            try {
-                String target = joinPath(dir, originalName);
+        ExecutorService fileExecutor =
+                Executors.newFixedThreadPool(fileParallel);
 
-                stage = "检查重名";
-                if (!overwrite && exists(base, token, target)) {
-                    stage = "生成避免重名的新文件名";
-                    target = timestampTarget(base, token, dir, originalName);
-                }
+        List<Future<?>> futures = new ArrayList<>();
 
-                finalName = baseName(target);
-                stage = "准备上传";
-                updateProgress(index, total, finalName, 0);
+        try {
+            for (int index = 0; index < uris.size(); index++) {
+                final int fileIndex = index;
+                final Uri uri = uris.get(index);
 
-                stage = "上传文件";
-                if (size > LARGE_FILE_THRESHOLD) {
-                    multipartUpload(
-                            base,
-                            token,
-                            uri,
-                            target,
-                            overwrite,
-                            size,
-                            index,
-                            total,
-                            finalName
-                    );
-                } else {
-                    uploadOne(
-                            base,
-                            token,
-                            uri,
-                            target,
-                            overwrite,
-                            size,
-                            index,
-                            total,
-                            finalName
-                    );
-                }
-
-                stage = "生成 OpenList 302 直链";
-                String directUrl = getOpenList302Url(base, token, target);
-                saveLastLink(directUrl, finalName);
-                saveHistory(directUrl, finalName, "success", "");
-
-                postComplete(index + 1, total, finalName, directUrl);
-            } catch (Exception e) {
-                String reason = friendlyError(e);
-                saveHistory("", finalName, "failed", stage + "： " + reason);
-                finishWithError(
-                        "文件：" + originalName +
-                                "\n阶段：" + stage +
-                                "\n原因：" + reason
+                futures.add(
+                        fileExecutor.submit(() ->
+                                uploadSingleFile(
+                                        base,
+                                        token,
+                                        dir,
+                                        overwrite,
+                                        uri,
+                                        fileIndex,
+                                        uris.size(),
+                                        chunkSize,
+                                        chunkParallel,
+                                        largeFileThreshold,
+                                        reservedTargets
+                                )
+                        )
                 );
-                return;
             }
+
+            boolean anyFailed = false;
+
+            for (Future<?> future : futures) {
+                try {
+                    future.get();
+                } catch (Exception e) {
+                    anyFailed = true;
+                }
+            }
+
+            postBatchFinished(
+                    uris.size(),
+                    anyFailed
+            );
+        } finally {
+            fileExecutor.shutdownNow();
         }
     }
 
-    private String timestampTarget(
+    private void uploadSingleFile(
             String base,
             String token,
             String dir,
-            String originalName
+            boolean overwrite,
+            Uri uri,
+            int index,
+            int total,
+            long chunkSize,
+            int chunkParallel,
+            long largeFileThreshold,
+            Set<String> reservedTargets
+    ) {
+        String originalName =
+                sanitizeFileName(displayName(uri));
+        long size = sizeOf(uri);
+        String finalName = originalName;
+        String stage = "准备";
+
+        try {
+            String target = reserveTarget(
+                    base,
+                    token,
+                    dir,
+                    originalName,
+                    overwrite,
+                    reservedTargets
+            );
+
+            finalName = baseName(target);
+
+            stage = "准备上传";
+            updateProgress(
+                    index,
+                    total,
+                    finalName,
+                    0,
+                    "准备上传",
+                    "uploading"
+            );
+
+            stage = "上传文件";
+
+            if (size > largeFileThreshold) {
+                multipartUpload(
+                        base,
+                        token,
+                        uri,
+                        target,
+                        overwrite,
+                        size,
+                        chunkSize,
+                        chunkParallel,
+                        index,
+                        total,
+                        finalName
+                );
+            } else {
+                uploadOne(
+                        base,
+                        token,
+                        uri,
+                        target,
+                        overwrite,
+                        size,
+                        index,
+                        total,
+                        finalName
+                );
+            }
+
+            stage = "生成 OpenList 302 直链";
+            String directUrl = getOpenList302Url(
+                    base,
+                    token,
+                    target
+            );
+
+            saveLastLink(directUrl, finalName);
+            saveHistory(
+                    directUrl,
+                    finalName,
+                    "success",
+                    ""
+            );
+
+            updateProgress(
+                    index,
+                    total,
+                    finalName,
+                    100,
+                    "上传完成",
+                    "completed"
+            );
+        } catch (Exception e) {
+            String reason = friendlyError(e);
+
+            saveHistory(
+                    "",
+                    finalName,
+                    "failed",
+                    stage + "： " + reason
+            );
+
+            updateProgress(
+                    index,
+                    total,
+                    finalName,
+                    0,
+                    stage + "： " + reason,
+                    "failed"
+            );
+        }
+    }
+
+    private String reserveTarget(
+            String base,
+            String token,
+            String dir,
+            String originalName,
+            boolean overwrite,
+            Set<String> reservedTargets
     ) throws Exception {
+        String target = joinPath(dir, originalName);
+
+        synchronized (reservedTargets) {
+            if (reservedTargets.contains(target)) {
+                target = localUniqueTarget(
+                        originalName,
+                        dir,
+                        reservedTargets
+                );
+            }
+
+            reservedTargets.add(target);
+        }
+
+        if (!overwrite && exists(base, token, target)) {
+            synchronized (reservedTargets) {
+                reservedTargets.remove(target);
+                target = timestampTarget(
+                        base,
+                        token,
+                        dir,
+                        originalName
+                );
+
+                while (reservedTargets.contains(target)) {
+                    target = timestampTarget(
+                            base,
+                            token,
+                            dir,
+                            originalName
+                    );
+                }
+
+                reservedTargets.add(target);
+            }
+        }
+
+        return target;
+    }
+
+    private String localUniqueTarget(
+            String originalName,
+            String dir,
+            Set<String> reservedTargets
+    ) {
         String stamp = new SimpleDateFormat(
                 "yyyy-MM-dd HH-mm-ss",
                 Locale.getDefault()
         ).format(new Date());
 
-        String candidate = appendTimestamp(originalName, stamp);
         int serial = 2;
+        String target;
 
-        while (exists(base, token, joinPath(dir, candidate))) {
-            candidate = appendTimestamp(
+        do {
+            String candidate = appendTimestamp(
                     originalName,
                     stamp + " #" + serial++
             );
-        }
 
-        return joinPath(dir, candidate);
+            target = joinPath(dir, candidate);
+        } while (reservedTargets.contains(target));
+
+        return target;
     }
 
-    private boolean exists(
-            String base,
-            String token,
-            String target
-    ) throws Exception {
-        String dir = parentPath(target);
-        String name = baseName(target);
+    private int clampInt(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
+    }
 
-        int page = 1;
+    private void initializeProgress(List<Uri> uris) {
+        JSONArray files = new JSONArray();
 
-        while (page <= 10000) {
-            JSONObject req = new JSONObject();
-            req.put("path", dir);
-            req.put("password", "");
-            req.put("page", page);
-            req.put("per_page", PAGE_SIZE);
-            req.put("refresh", false);
+        for (Uri uri : uris) {
+            JSONObject item = new JSONObject();
 
-            HttpResult result = requestJson(
-                    "POST",
-                    base + "/api/fs/list",
-                    token,
-                    req.toString()
-            );
-
-            if (result.httpCode < 200 || result.httpCode >= 300) {
-                throw new IOException(
-                        "检查重名失败 HTTP " +
-                                result.httpCode +
-                                "：" +
-                                safeMessage(result.body)
+            try {
+                item.put(
+                        "name",
+                        sanitizeFileName(displayName(uri))
                 );
-            }
-
-            JSONObject json = new JSONObject(result.body);
-            int code = json.optInt("code", result.httpCode);
-
-            if (code != 200) {
-                throw new IOException(
-                        "检查重名失败 " +
-                                code +
-                                "：" +
-                                json.optString("message", result.body)
+                item.put(
+                        "size",
+                        Math.max(0L, sizeOf(uri))
                 );
+                item.put("progress", 0);
+                item.put("status", "pending");
+                item.put("detail", "等待上传");
+            } catch (Exception ignored) {
             }
 
-            JSONObject data = json.optJSONObject("data");
-            if (data == null) return false;
-
-            JSONArray content = data.optJSONArray("content");
-            int reportedTotal = data.optInt(
-                    "total",
-                    content == null ? 0 : content.length()
-            );
-
-            if (content != null) {
-                for (int i = 0; i < content.length(); i++) {
-                    JSONObject item = content.optJSONObject(i);
-
-                    if (item != null &&
-                            name.equals(item.optString("name", ""))) {
-                        return true;
-                    }
-                }
-            }
-
-            if (content == null ||
-                    content.length() == 0 ||
-                    page * PAGE_SIZE >= reportedTotal) {
-                return false;
-            }
-
-            page++;
+            files.put(item);
         }
 
-        throw new IOException("目录文件过多，无法安全检查同名文件");
+        synchronized (this) {
+            getSharedPreferences(
+                    MainActivity.PREFS,
+                    MODE_PRIVATE
+            ).edit()
+                    .putString(
+                            MainActivity.KEY_UPLOAD_PROGRESS,
+                            files.toString()
+                    )
+                    .apply();
+        }
     }
 
     private void uploadOne(
@@ -396,6 +559,8 @@ public class UploadService extends Service {
             String target,
             boolean overwrite,
             long size,
+            long chunkSize,
+            int chunkParallel,
             int index,
             int total,
             String displayName
@@ -419,24 +584,39 @@ public class UploadService extends Service {
             throw new IOException("OpenList 分片初始化未返回 upload_id");
         }
 
-        long chunkSize = initData.optLong("chunk_size", REQUESTED_CHUNK_SIZE);
-        if (chunkSize <= 0 || chunkSize > 64L * 1024L * 1024L) {
-            throw new IOException("OpenList 返回了异常的分片大小：" + chunkSize);
+        long serverChunkSize =
+                initData.optLong("chunk_size", chunkSize);
+
+        if (serverChunkSize <= 0 ||
+                serverChunkSize > 64L * 1024L * 1024L) {
+            throw new IOException(
+                    "OpenList 返回了异常的分片大小：" +
+                            serverChunkSize
+            );
         }
 
-        int reportedTotalChunks = initData.optInt("total_chunks", 0);
-        if (reportedTotalChunks <= 0) {
-            reportedTotalChunks = (int) ((size + chunkSize - 1) / chunkSize);
+        if (serverChunkSize != chunkSize) {
+            chunkSize = serverChunkSize;
         }
+
+        int reportedTotalChunks =
+                initData.optInt("total_chunks", 0);
+
+        if (reportedTotalChunks <= 0) {
+            reportedTotalChunks =
+                    (int) ((size + chunkSize - 1) / chunkSize);
+        }
+
         final int totalChunks = reportedTotalChunks;
 
         ExecutorService chunkExecutor =
-                Executors.newFixedThreadPool(MAX_PARALLEL_CHUNKS);
+                Executors.newFixedThreadPool(chunkParallel);
         CompletionService<ChunkUploadResult> completion =
                 new ExecutorCompletionService<>(chunkExecutor);
         List<Future<ChunkUploadResult>> futures = new ArrayList<>();
 
-        long completedBytes = 0;
+        AtomicLong transferredBytes = new AtomicLong(0);
+        AtomicLong lastProgressUpdate = new AtomicLong(0);
         int submitted = 0;
         int completed = 0;
         boolean allDone = false;
@@ -452,21 +632,23 @@ public class UploadService extends Service {
                 while (submitted - completed >= MAX_PARALLEL_CHUNKS) {
                     ChunkUploadResult result = awaitChunk(completion);
                     completed++;
-                    completedBytes += result.length;
 
                     updateProgress(
                             index,
                             total,
-                            displayName +
-                                    " · 分片 " +
+                            displayName,
+                            (int) Math.min(
+                                    99L,
+                                    transferredBytes.get() * 100L / size
+                            ),
+                            "分片 " +
                                     (result.index + 1) +
                                     "/" +
                                     totalChunks +
-                                    " · 4路并行",
-                            (int) Math.min(
-                                    100L,
-                                    completedBytes * 100L / size
-                            )
+                                    " · " +
+                                    chunkParallel +
+                                    "路并行",
+                            "uploading"
                     );
                 }
 
@@ -515,7 +697,48 @@ public class UploadService extends Service {
                                             uploadId,
                                             chunkIndex,
                                             chunk,
-                                            chunkLength
+                                            chunkLength,
+                                            delta -> {
+                                                long current =
+                                                        transferredBytes.addAndGet(delta);
+                                                long now =
+                                                        System.currentTimeMillis();
+                                                long last =
+                                                        lastProgressUpdate.get();
+
+                                                if (delta < 0 ||
+                                                        now - last >= 250L ||
+                                                        current >= size - 1) {
+                                                    if (lastProgressUpdate.compareAndSet(
+                                                            last,
+                                                            now
+                                                    ) || delta < 0) {
+                                                        int progress =
+                                                                (int) Math.min(
+                                                                        99L,
+                                                                        Math.max(
+                                                                                0L,
+                                                                                current * 100L / size
+                                                                        )
+                                                                );
+
+                                                        updateProgress(
+                                                                index,
+                                                                total,
+                                                                displayName,
+                                                                progress,
+                                                                "正在上传 · 分片 " +
+                                                                        (chunkIndex + 1) +
+                                                                        "/" +
+                                                                        totalChunks +
+                                                                        " · " +
+                                                                        chunkParallel +
+                                                                        "路并行",
+                                                                "uploading"
+                                                        );
+                                                    }
+                                                }
+                                            }
                                     );
 
                                     return new ChunkUploadResult(
@@ -556,21 +779,23 @@ public class UploadService extends Service {
             while (completed < submitted) {
                 ChunkUploadResult result = awaitChunk(completion);
                 completed++;
-                completedBytes += result.length;
 
                 updateProgress(
                         index,
                         total,
-                        displayName +
-                                " · 分片 " +
+                        displayName,
+                        (int) Math.min(
+                                99L,
+                                transferredBytes.get() * 100L / size
+                        ),
+                        "分片 " +
                                 (result.index + 1) +
                                 "/" +
                                 totalChunks +
-                                " · 4路并行",
-                        (int) Math.min(
-                                100L,
-                                completedBytes * 100L / size
-                        )
+                                " · " +
+                                chunkParallel +
+                                "路并行",
+                        "uploading"
                 );
             }
 
@@ -604,7 +829,9 @@ public class UploadService extends Service {
                 index,
                 total,
                 displayName,
-                100
+                100,
+                "文件上传完成，正在合并",
+                "uploading"
         );
     }
 
@@ -656,7 +883,7 @@ public class UploadService extends Service {
             conn.setRequestProperty("X-File-Size", Long.toString(size));
             conn.setRequestProperty(
                     "X-Chunk-Size",
-                    Integer.toString(REQUESTED_CHUNK_SIZE)
+                    Long.toString(chunkSize)
             );
             conn.setRequestProperty(
                     "Overwrite",
@@ -715,18 +942,25 @@ public class UploadService extends Service {
         }
     }
 
+    private interface ChunkProgressListener {
+        void onDelta(long delta);
+    }
+
     private void multipartChunk(
             String base,
             String token,
             String uploadId,
             int chunkIndex,
             byte[] buffer,
-            int length
+            int length,
+            ChunkProgressListener progressListener
     ) throws Exception {
         HttpURLConnection conn = null;
+        long sentThisAttempt = 0;
 
         try {
-            URL url = new URL(base + "/api/fs/multipart/chunk");
+            URL url =
+                    new URL(base + "/api/fs/multipart/chunk");
             conn = (HttpURLConnection) url.openConnection();
 
             conn.setRequestMethod("PUT");
@@ -734,9 +968,18 @@ public class UploadService extends Service {
             conn.setReadTimeout(0);
             conn.setDoOutput(true);
 
-            conn.setRequestProperty("Authorization", token);
-            conn.setRequestProperty("X-Upload-Id", uploadId);
-            conn.setRequestProperty("X-Chunk-Index", Integer.toString(chunkIndex));
+            conn.setRequestProperty(
+                    "Authorization",
+                    token
+            );
+            conn.setRequestProperty(
+                    "X-Upload-Id",
+                    uploadId
+            );
+            conn.setRequestProperty(
+                    "X-Chunk-Index",
+                    Integer.toString(chunkIndex)
+            );
             conn.setRequestProperty(
                     "Content-Type",
                     "application/octet-stream"
@@ -744,7 +987,27 @@ public class UploadService extends Service {
             conn.setFixedLengthStreamingMode(length);
 
             try (OutputStream out = conn.getOutputStream()) {
-                out.write(buffer, 0, length);
+                int offset = 0;
+
+                while (offset < length) {
+                    int writeLength = Math.min(
+                            PROGRESS_WRITE_SIZE,
+                            length - offset
+                    );
+
+                    out.write(
+                            buffer,
+                            offset,
+                            writeLength
+                    );
+
+                    offset += writeLength;
+                    sentThisAttempt += writeLength;
+
+                    if (progressListener != null) {
+                        progressListener.onDelta(writeLength);
+                    }
+                }
             }
 
             int httpCode = conn.getResponseCode();
@@ -762,6 +1025,7 @@ public class UploadService extends Service {
             }
 
             JSONObject json;
+
             try {
                 json = body.isEmpty()
                         ? new JSONObject()
@@ -778,7 +1042,11 @@ public class UploadService extends Service {
                 );
             }
 
-            int code = json.optInt("code", httpCode);
+            int code =
+                    json.optInt(
+                            "code",
+                            httpCode
+                    );
 
             if (code != 200) {
                 throw new IOException(
@@ -787,15 +1055,26 @@ public class UploadService extends Service {
                                 " 失败 " +
                                 code +
                                 "：" +
-                                json.optString("message", body)
+                                json.optString(
+                                        "message",
+                                        body
+                                )
                 );
             }
+        } catch (Exception e) {
+            if (sentThisAttempt > 0 &&
+                    progressListener != null) {
+                progressListener.onDelta(-sentThisAttempt);
+            }
+
+            throw e;
         } finally {
             if (conn != null) {
                 conn.disconnect();
             }
         }
     }
+
 
     private JSONObject multipartComplete(
             String base,
@@ -940,7 +1219,7 @@ public class UploadService extends Service {
         return link;
     }
 
-    private void saveLastLink(String url, String name) {
+    private synchronized void saveLastLink(String url, String name) {
         getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
                 .edit()
                 .putString(MainActivity.KEY_LAST_URL, url)
@@ -948,7 +1227,7 @@ public class UploadService extends Service {
                 .apply();
     }
 
-    private void saveHistory(String url, String name, String status, String error) {
+    private synchronized void saveHistory(String url, String name, String status, String error) {
         SharedPreferences prefs =
                 getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
 
@@ -998,67 +1277,237 @@ public class UploadService extends Service {
         return 49;
     }
 
-    private void postComplete(
-            int completed,
-            int total,
-            String name,
-            String url
-    ) {
-        int overall = total == 0
-                ? 100
-                : (completed * 100 / total);
-
-        String text = completed == total
-                ? name + "\n" + url
-                : completed + "/" + total + " · " + name + "\n" + url;
-
-        NotificationManager nm =
-                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-
-        nm.notify(
-                NOTIFICATION_ID,
-                buildNotification(
-                        completed == total
-                                ? "OpenList 快传完成"
-                                : "OpenList 快传",
-                        text,
-                        overall,
-                        completed != total,
-                        url
-                )
-        );
-    }
-
-    private void updateProgress(
+    private synchronized void updateProgress(
             int index,
             int total,
             String name,
             int fileProgress
     ) {
-        int completed = index;
+        updateProgress(
+                index,
+                total,
+                name,
+                fileProgress,
+                "上传中",
+                "uploading"
+        );
+    }
 
-        int overall = total <= 0
-                ? fileProgress
-                : (int) Math.min(
-                        100L,
-                        ((long) completed * 100L + fileProgress) / total
+    private synchronized void updateProgress(
+            int index,
+            int total,
+            String name,
+            int fileProgress,
+            String detail,
+            String status
+    ) {
+        SharedPreferences prefs =
+                getSharedPreferences(
+                        MainActivity.PREFS,
+                        MODE_PRIVATE
                 );
 
+        String raw = prefs.getString(
+                MainActivity.KEY_UPLOAD_PROGRESS,
+                ""
+        );
+
+        if (raw.isEmpty()) return;
+
+        try {
+            JSONArray files = new JSONArray(raw);
+
+            if (index < 0 || index >= files.length()) return;
+
+            JSONObject item = files.optJSONObject(index);
+            if (item == null) return;
+
+            item.put("name", name);
+            item.put(
+                    "progress",
+                    Math.max(
+                            0,
+                            Math.min(100, fileProgress)
+                    )
+            );
+            item.put("status", status);
+            item.put(
+                    "detail",
+                    detail == null ? "" : detail
+            );
+
+            prefs.edit()
+                    .putString(
+                            MainActivity.KEY_UPLOAD_PROGRESS,
+                            files.toString()
+                    )
+                    .apply();
+
+            notifyUploadProgress(files, total);
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void notifyUploadProgress(
+            JSONArray files,
+            int total
+    ) {
+        long totalBytes = 0;
+        long completedBytes = 0;
+        int completedCount = 0;
+        StringBuilder active = new StringBuilder();
+
+        for (int i = 0; i < files.length(); i++) {
+            JSONObject item = files.optJSONObject(i);
+            if (item == null) continue;
+
+            long size = Math.max(
+                    0L,
+                    item.optLong("size", 0)
+            );
+
+            int progress = Math.max(
+                    0,
+                    Math.min(
+                            100,
+                            item.optInt("progress", 0)
+                    )
+            );
+
+            String status =
+                    item.optString("status", "pending");
+
+            if (size > 0) {
+                totalBytes += size;
+                completedBytes +=
+                        size * progress / 100L;
+            }
+
+            if ("completed".equals(status)) {
+                completedCount++;
+            } else if ("uploading".equals(status)) {
+                if (active.length() > 0) {
+                    active.append(" · ");
+                }
+
+                active.append(
+                        item.optString(
+                                "name",
+                                "upload.bin"
+                        )
+                ).append(" ").append(progress).append("%");
+            }
+        }
+
+        int overall = totalBytes <= 0
+                ? 0
+                : (int) Math.min(
+                        100L,
+                        completedBytes * 100L / totalBytes
+                );
+
+        String summary =
+                "总进度 " +
+                        overall +
+                        "% · " +
+                        completedCount +
+                        "/" +
+                        total +
+                        " 完成";
+
+        if (active.length() > 0) {
+            summary += " · " + active;
+        }
+
         NotificationManager nm =
-                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                (NotificationManager) getSystemService(
+                        NOTIFICATION_SERVICE
+                );
+
+        boolean finished =
+                completedCount == total && total > 0;
 
         nm.notify(
                 NOTIFICATION_ID,
                 buildNotification(
-                        "OpenList 快传",
-                        (index + 1) + "/" + total +
-                                " · " + name +
-                                " · " + fileProgress + "%",
+                        finished
+                                ? "OpenList 快传完成"
+                                : "OpenList 快传",
+                        summary,
                         overall,
-                        true,
+                        !finished,
                         getLastUrl()
                 )
         );
+    }
+
+    private void postBatchFinished(
+            int total,
+            boolean anyFailed
+    ) {
+        String raw = getSharedPreferences(
+                MainActivity.PREFS,
+                MODE_PRIVATE
+        ).getString(
+                MainActivity.KEY_UPLOAD_PROGRESS,
+                ""
+        );
+
+        if (raw.isEmpty()) return;
+
+        try {
+            JSONArray files = new JSONArray(raw);
+            int completed = 0;
+            int failed = 0;
+
+            for (int i = 0; i < files.length(); i++) {
+                JSONObject item = files.optJSONObject(i);
+                if (item == null) continue;
+
+                String status =
+                        item.optString("status", "");
+
+                if ("completed".equals(status)) {
+                    completed++;
+                } else if ("failed".equals(status)) {
+                    failed++;
+                }
+            }
+
+            String title;
+            String text;
+
+            if (failed == 0 && completed == total) {
+                title = "OpenList 快传完成";
+                text = "全部 " + total + " 个文件上传成功";
+            } else {
+                title = "OpenList 快传结束";
+                text = completed + " 个成功";
+
+                if (failed > 0) {
+                    text += " · " + failed + " 个失败";
+                }
+            }
+
+            NotificationManager nm =
+                    (NotificationManager) getSystemService(
+                            NOTIFICATION_SERVICE
+                    );
+
+            nm.notify(
+                    NOTIFICATION_ID,
+                    buildNotification(
+                            title,
+                            text,
+                            completed == total ? 100 : 0,
+                            false,
+                            getLastUrl()
+                    )
+            );
+        } catch (Exception ignored) {
+        }
+
+        detachForeground();
     }
 
     private Notification buildNotification(
