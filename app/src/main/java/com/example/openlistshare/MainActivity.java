@@ -160,7 +160,7 @@ public class MainActivity extends Activity {
         root.addView(dirInput, matchWrap());
 
         root.addView(label("分片大小（MiB，1-64）"));
-        chunkSizeInput = input("2");
+        chunkSizeInput = input("10");
         root.addView(chunkSizeInput, matchWrap());
 
         root.addView(label("每个文件并行分片数（1-8）"));
@@ -172,7 +172,7 @@ public class MainActivity extends Activity {
         root.addView(fileParallelInput, matchWrap());
 
         root.addView(label("大文件分片阈值（MiB，1-1024）"));
-        largeFileThresholdInput = input("512");
+        largeFileThresholdInput = input("32");
         root.addView(largeFileThresholdInput, matchWrap());
 
         TextView parallelHint = new TextView(this);
@@ -284,9 +284,9 @@ public class MainActivity extends Activity {
         baseUrlInput.setText(p.getString(KEY_BASE, ""));
         tokenInput.setText(p.getString(KEY_TOKEN, ""));
         dirInput.setText(p.getString(KEY_DIR, "/uploads"));
-        int storedChunkSize = p.getInt(KEY_CHUNK_SIZE_MB, 2);
+        int storedChunkSize = p.getInt(KEY_CHUNK_SIZE_MB, 10);
         int storedChunkParallel = p.getInt(KEY_CHUNK_PARALLEL, 3);
-        int storedThreshold = p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 512);
+        int storedThreshold = p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 32);
 
         // Migrate the previous built-in defaults. OpenList multipart has a
         // bounded server-side ring window, so medium files are smoother with
@@ -312,7 +312,7 @@ public class MainActivity extends Activity {
         int chunkSizeMb = parseIntInRange(chunkSizeInput, 2, 1, 64);
         int chunkParallel = parseIntInRange(chunkParallelInput, 3, 1, 8);
         int fileParallel = parseIntInRange(fileParallelInput, 2, 1, 4);
-        int thresholdMb = parseIntInRange(largeFileThresholdInput, 512, 1, 1024);
+        int thresholdMb = parseIntInRange(largeFileThresholdInput, 32, 1, 1024);
 
         if (chunkSizeMb < 1 || chunkParallel < 1 ||
                 fileParallel < 1 || thresholdMb < 1) {
