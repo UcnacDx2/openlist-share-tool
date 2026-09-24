@@ -38,7 +38,9 @@ public class UploadService extends Service {
     private static final int NOTIFICATION_ID = 20260924;
     private static final int PAGE_SIZE = 1000;
     private static final int LARGE_FILE_THRESHOLD = 8 * 1024 * 1024;
-    private static final int REQUESTED_CHUNK_SIZE = 8 * 1024 * 1024;
+    // Keep each HTTP request small enough for common reverse-proxy limits.
+    // OpenList's multipart implementation accepts 1 MiB as its minimum chunk size.
+    private static final int REQUESTED_CHUNK_SIZE = 1 * 1024 * 1024;
     private static final int CHUNK_RETRIES = 3;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
