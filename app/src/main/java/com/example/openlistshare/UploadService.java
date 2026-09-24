@@ -424,10 +424,11 @@ public class UploadService extends Service {
             throw new IOException("OpenList 返回了异常的分片大小：" + chunkSize);
         }
 
-        int totalChunks = initData.optInt("total_chunks", 0);
-        if (totalChunks <= 0) {
-            totalChunks = (int) ((size + chunkSize - 1) / chunkSize);
+        int reportedTotalChunks = initData.optInt("total_chunks", 0);
+        if (reportedTotalChunks <= 0) {
+            reportedTotalChunks = (int) ((size + chunkSize - 1) / chunkSize);
         }
+        final int totalChunks = reportedTotalChunks;
 
         ExecutorService chunkExecutor =
                 Executors.newFixedThreadPool(MAX_PARALLEL_CHUNKS);
