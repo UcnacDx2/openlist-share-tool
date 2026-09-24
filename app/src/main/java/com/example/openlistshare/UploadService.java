@@ -907,6 +907,8 @@ public class UploadService extends Service {
             chunkSize = serverChunkSize;
         }
 
+        final long effectiveChunkSize = chunkSize;
+
         int reportedTotalChunks =
                 initData.optInt("total_chunks", 0);
 
@@ -939,7 +941,7 @@ public class UploadService extends Service {
                         (long) chunkParallel,
                         Math.max(
                                 1L,
-                                maxPrefetchBytes / chunkSize
+                                maxPrefetchBytes / effectiveChunkSize
                         )
                 )
         );
@@ -979,9 +981,9 @@ public class UploadService extends Service {
 
                             try {
                                 long chunkOffset =
-                                        (long) chunkIndex * chunkSize;
+                                        (long) chunkIndex * effectiveChunkSize;
                                 int expected = (int) Math.min(
-                                        chunkSize,
+                                        effectiveChunkSize,
                                         size - chunkOffset
                                 );
 
