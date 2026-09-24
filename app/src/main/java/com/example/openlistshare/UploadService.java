@@ -1313,58 +1313,82 @@ public class UploadService extends Service {
             String token,
             String uploadId
     ) throws Exception {
-        HttpResult result = requestJson(
-                "GET",
-                base +
-                        "/api/fs/multipart/status?upload_id=" +
-                        Uri.encode(uploadId),
-                token,
-                ""
-        );
+        HttpURLConnection conn = null;
 
-        if (result.httpCode < 200 ||
-                result.httpCode >= 300) {
-            throw new IOException(
-                    "OpenList 分片状态 HTTP " +
-                            result.httpCode +
-                            "：" +
-                            safeMessage(result.body)
+        try {
+            URL url = new URL(
+                    base +
+                            "/api/fs/multipart/status?upload_id=" +
+                            Uri.encode(uploadId)
             );
-        }
 
-        JSONObject json =
-                result.body.isEmpty()
-                        ? new JSONObject()
-                        : new JSONObject(result.body);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("GET");
+            conn.setConnectTimeout(5000);
+            conn.setReadTimeout(5000);
+            conn.setDoInput(true);
+            conn.setDoOutput(false);
 
-        int code =
-                json.optInt(
-                        "code",
-                        result.httpCode
+            conn.setRequestProperty(
+                    "Authorization",
+                    token
+            );
+            conn.setRequestProperty(
+                    "Accept",
+                    "application/json"
+            );
+
+            int httpCode = conn.getResponseCode();
+            String body = readBody(conn);
+
+            if (httpCode < 200 ||
+                    httpCode >= 300) {
+                throw new IOException(
+                        "OpenList 分片状态 HTTP " +
+                                httpCode +
+                                "：" +
+                                safeMessage(body)
                 );
+            }
 
-        if (code != 200) {
-            throw new IOException(
-                    "OpenList 分片状态失败 " +
-                            code +
-                            "：" +
-                            json.optString(
-                                    "message",
-                                    result.body
-                            )
-            );
+            JSONObject json =
+                    body.isEmpty()
+                            ? new JSONObject()
+                            : new JSONObject(body);
+
+            int code =
+                    json.optInt(
+                            "code",
+                            httpCode
+                    );
+
+            if (code != 200) {
+                throw new IOException(
+                        "OpenList 分片状态失败 " +
+                                code +
+                                "：" +
+                                json.optString(
+                                        "message",
+                                        body
+                                )
+                );
+            }
+
+            JSONObject data =
+                    json.optJSONObject("data");
+
+            if (data == null) {
+                throw new IOException(
+                        "OpenList 分片状态没有 data"
+                );
+            }
+
+            return data;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
-
-        JSONObject data =
-                json.optJSONObject("data");
-
-        if (data == null) {
-            throw new IOException(
-                    "OpenList 分片状态没有 data"
-            );
-        }
-
-        return data;
     }
 
     private String formatPercent(double value) {
