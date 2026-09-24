@@ -160,11 +160,11 @@ public class MainActivity extends Activity {
         root.addView(dirInput, matchWrap());
 
         root.addView(label("分片大小（MiB，1-64）"));
-        chunkSizeInput = input("8");
+        chunkSizeInput = input("2");
         root.addView(chunkSizeInput, matchWrap());
 
         root.addView(label("每个文件并行分片数（1-8）"));
-        chunkParallelInput = input("4");
+        chunkParallelInput = input("3");
         root.addView(chunkParallelInput, matchWrap());
 
         root.addView(label("同时上传文件数（1-4）"));
@@ -284,8 +284,8 @@ public class MainActivity extends Activity {
         baseUrlInput.setText(p.getString(KEY_BASE, ""));
         tokenInput.setText(p.getString(KEY_TOKEN, ""));
         dirInput.setText(p.getString(KEY_DIR, "/uploads"));
-        chunkSizeInput.setText(Integer.toString(p.getInt(KEY_CHUNK_SIZE_MB, 8)));
-        chunkParallelInput.setText(Integer.toString(p.getInt(KEY_CHUNK_PARALLEL, 4)));
+        chunkSizeInput.setText(Integer.toString(p.getInt(KEY_CHUNK_SIZE_MB, 2)));
+        chunkParallelInput.setText(Integer.toString(p.getInt(KEY_CHUNK_PARALLEL, 3)));
         fileParallelInput.setText(Integer.toString(p.getInt(KEY_FILE_PARALLEL, 2)));
         largeFileThresholdInput.setText(Integer.toString(p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 8)));
         overwriteBox.setChecked(p.getBoolean(KEY_OVERWRITE, false));
@@ -294,8 +294,8 @@ public class MainActivity extends Activity {
     }
 
     private boolean saveConfig() {
-        int chunkSizeMb = parseIntInRange(chunkSizeInput, 8, 1, 64);
-        int chunkParallel = parseIntInRange(chunkParallelInput, 4, 1, 8);
+        int chunkSizeMb = parseIntInRange(chunkSizeInput, 2, 1, 64);
+        int chunkParallel = parseIntInRange(chunkParallelInput, 3, 1, 8);
         int fileParallel = parseIntInRange(fileParallelInput, 2, 1, 4);
         int thresholdMb = parseIntInRange(largeFileThresholdInput, 8, 1, 1024);
 
