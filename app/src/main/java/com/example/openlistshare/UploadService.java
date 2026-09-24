@@ -42,11 +42,11 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerArray;
-import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
@@ -66,7 +66,9 @@ public class UploadService extends Service {
     private static final int CHUNK_RETRIES = 3;
     private static final int PROGRESS_WRITE_SIZE = 128 * 1024;
 
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final ExecutorService executor = Executors.newCachedThreadPool();
+    private static final Object FILE_LIMIT_LOCK = new Object();
+    private static int ACTIVE_FILE_UPLOADS = 0;
     private volatile BatchProgress activeBatchProgress;
     private ScheduledExecutorService progressScheduler;
 
@@ -133,6 +135,25 @@ public class UploadService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    private static void acquireGlobalFileSlot(int limit)
+            throws InterruptedException {
+        synchronized (FILE_LIMIT_LOCK) {
+            while (ACTIVE_FILE_UPLOADS >= limit) {
+                FILE_LIMIT_LOCK.wait();
+            }
+            ACTIVE_FILE_UPLOADS++;
+        }
+    }
+
+    private static void releaseGlobalFileSlot() {
+        synchronized (FILE_LIMIT_LOCK) {
+            if (ACTIVE_FILE_UPLOADS > 0) {
+                ACTIVE_FILE_UPLOADS--;
+            }
+            FILE_LIMIT_LOCK.notifyAll();
+        }
     }
 
     private void uploadAll(List<Uri> uris) {
@@ -218,7 +239,14 @@ public class UploadService extends Service {
                 final Uri uri = uris.get(index);
 
                 futures.add(
-                        fileExecutor.submit(() ->
+                        fileExecutor.submit(() -> {
+                            boolean acquired = false;
+                            try {
+                                acquireGlobalFileSlot(
+                                        fileParallel
+                                );
+                                acquired = true;
+
                                 uploadSingleFile(
                                         base,
                                         token,
@@ -231,8 +259,13 @@ public class UploadService extends Service {
                                         chunkParallel,
                                         largeFileThreshold,
                                         reservedTargets
-                                )
-                        )
+                                );
+                            } finally {
+                                if (acquired) {
+                                    releaseGlobalFileSlot();
+                                }
+                            }
+                        })
                 );
             }
 
