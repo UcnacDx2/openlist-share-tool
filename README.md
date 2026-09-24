@@ -13,6 +13,7 @@ Android 原生分享/打开文件 → OpenList 上传 → 获取 OpenList 的 `/
 - 「直接覆盖」可手动开启
 - 直链使用 OpenList 的 `/d/...` 下载入口，不使用上游网盘 `raw_url`
 - 若 OpenList 返回签名，会自动追加 `?sign=...`
+- 大文件使用 OpenList Multipart：默认 8 MiB 分片、最多 4 路并行上传；单文件内存占用控制在约 32 MiB 的分片缓冲量
 
 ## 为什么自己处理重名
 
