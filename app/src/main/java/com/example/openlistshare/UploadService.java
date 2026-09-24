@@ -242,10 +242,18 @@ public class UploadService extends Service {
                         fileExecutor.submit(() -> {
                             boolean acquired = false;
                             try {
-                                acquireGlobalFileSlot(
-                                        fileParallel
-                                );
-                                acquired = true;
+                                try {
+                                    acquireGlobalFileSlot(
+                                            fileParallel
+                                    );
+                                    acquired = true;
+                                } catch (InterruptedException e) {
+                                    Thread.currentThread().interrupt();
+                                    throw new RuntimeException(
+                                            "上传被中断",
+                                            e
+                                    );
+                                }
 
                                 uploadSingleFile(
                                         base,
