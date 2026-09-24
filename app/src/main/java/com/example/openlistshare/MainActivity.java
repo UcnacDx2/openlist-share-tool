@@ -284,8 +284,19 @@ public class MainActivity extends Activity {
         baseUrlInput.setText(p.getString(KEY_BASE, ""));
         tokenInput.setText(p.getString(KEY_TOKEN, ""));
         dirInput.setText(p.getString(KEY_DIR, "/uploads"));
-        chunkSizeInput.setText(Integer.toString(p.getInt(KEY_CHUNK_SIZE_MB, 2)));
-        chunkParallelInput.setText(Integer.toString(p.getInt(KEY_CHUNK_PARALLEL, 3)));
+        int storedChunkSize = p.getInt(KEY_CHUNK_SIZE_MB, 2);
+        int storedChunkParallel = p.getInt(KEY_CHUNK_PARALLEL, 3);
+
+        // Migrate the previous built-in tuning once: the old 8 MiB / 4-way
+        // defaults could fill OpenList's per-session multipart window and
+        // cause visible idle gaps on slower storage backends.
+        if (storedChunkSize == 8 && storedChunkParallel == 4) {
+            storedChunkSize = 2;
+            storedChunkParallel = 3;
+        }
+
+        chunkSizeInput.setText(Integer.toString(storedChunkSize));
+        chunkParallelInput.setText(Integer.toString(storedChunkParallel));
         fileParallelInput.setText(Integer.toString(p.getInt(KEY_FILE_PARALLEL, 2)));
         largeFileThresholdInput.setText(Integer.toString(p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 8)));
         overwriteBox.setChecked(p.getBoolean(KEY_OVERWRITE, false));
