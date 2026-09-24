@@ -1336,13 +1336,25 @@ public class UploadService extends Service {
     private String safeMessage(String body) {
         if (body == null || body.isEmpty()) return "无返回内容";
 
+        String compact = body
+                .replace("\\r", "")
+                .replace("\\n", " ")
+                .replaceAll("\\s+", " ")
+                .trim();
+
+        if (compact.startsWith("<!doctype") ||
+                compact.startsWith("<html") ||
+                compact.contains("<meta name="generator" content="OpenList"")) {
+            return "服务器返回 OpenList 前端页面，当前服务端未提供 Multipart API；请升级 OpenList 至 v4.2.5 或更高版本";
+        }
+
         try {
             return new JSONObject(body)
                     .optString("message", body);
         } catch (Exception ignored) {
-            return body.length() > 300
-                    ? body.substring(0, 300)
-                    : body;
+            return compact.length() > 300
+                    ? compact.substring(0, 300)
+                    : compact;
         }
     }
 
