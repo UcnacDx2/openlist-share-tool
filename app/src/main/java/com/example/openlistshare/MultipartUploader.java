@@ -326,21 +326,67 @@ public final class MultipartUploader {
             attemptLoaded.put(chunkIndex, loaded);
 
             try {
-                Response response = executeChunk(
-                        base,
-                        token,
-                        uploadId,
-                        chunkIndex,
-                        source,
-                        chunkIndex * chunkSize,
-                        chunkLength,
-                        loaded,
-                        inFlightBytes,
-                        ackedBytes,
-                        peakBytes,
-                        lastReportAt,
-                        listener
-                );
+                Response response;
+
+                try {
+                    // Only this call is a transport-level operation. HTTP
+                    // responses are handled below and are never mistaken for
+                    // network failures.
+                    response = executeChunk(
+                            base,
+                            token,
+                            uploadId,
+                            chunkIndex,
+                            source,
+                            chunkIndex * chunkSize,
+                            chunkLength,
+                            loaded,
+                            inFlightBytes,
+                            ackedBytes,
+                            peakBytes,
+                            lastReportAt,
+                            listener
+                    );
+                } catch (IOException networkError) {
+                    StatusResult status =
+                            probeStatus(
+                                    base,
+                                    token,
+                                    uploadId
+                            );
+
+                    if (status.httpCode == 404 ||
+                            isCompleted(status.data)) {
+                        completedEarly.set(true);
+                        return;
+                    }
+
+                    if (isFailed(status.data)) {
+                        throw new IOException(
+                                status.data.optString(
+                                        "error",
+                                        "OpenList 分片上传失败"
+                                ),
+                                networkError
+                        );
+                    }
+
+                    flowRetries++;
+                    if (flowRetries > MAX_FLOW_RETRIES) {
+                        throw new IOException(
+                                "第 " +
+                                        (chunkIndex + 1) +
+                                        " 片网络异常，重试次数耗尽",
+                                networkError
+                        );
+                    }
+
+                    sleepFlowBackoff(
+                            false,
+                            flowRetries
+                    );
+                    continue;
+                }
 
                 int httpCode = response.code();
                 String body = responseBody(response);
@@ -401,9 +447,8 @@ public final class MultipartUploader {
                     return;
                 }
 
-                // Match OpenList frontend: 429/409 are flow-control signals,
-                // not upload failures. The server-side window already waits
-                // for storage consumption; retry patiently.
+                // Match OpenList frontend exactly: 429 / 409 mean the
+                // receiving window is applying flow control, not failure.
                 if (apiCode == 429 || apiCode == 409) {
                     flowRetries++;
                     if (flowRetries > MAX_FLOW_RETRIES) {
@@ -413,7 +458,11 @@ public final class MultipartUploader {
                                         " 片等待服务器过久"
                         );
                     }
-                    sleepFlowBackoff(true, flowRetries);
+
+                    sleepFlowBackoff(
+                            true,
+                            flowRetries
+                    );
                     continue;
                 }
 
@@ -429,44 +478,6 @@ public final class MultipartUploader {
                                         httpCode
                                 )
                 );
-            } catch (IOException networkError) {
-                // A transport-level failure is ambiguous: the server may
-                // already have accepted the chunk. Probe the session first,
-                // exactly like the official frontend.
-                StatusResult status =
-                        probeStatus(
-                                base,
-                                token,
-                                uploadId
-                        );
-
-                if (status.httpCode == 404 ||
-                        isCompleted(status.data)) {
-                    completedEarly.set(true);
-                    return;
-                }
-
-                if (isFailed(status.data)) {
-                    throw new IOException(
-                            status.data.optString(
-                                    "error",
-                                    "OpenList 分片上传失败"
-                            ),
-                            networkError
-                    );
-                }
-
-                flowRetries++;
-                if (flowRetries > MAX_FLOW_RETRIES) {
-                    throw new IOException(
-                            "第 " +
-                                    (chunkIndex + 1) +
-                                    " 片网络异常，重试次数耗尽",
-                            networkError
-                    );
-                }
-
-                sleepFlowBackoff(false, flowRetries);
             } finally {
                 long sent = loaded.getAndSet(0L);
                 if (sent != 0L) {
