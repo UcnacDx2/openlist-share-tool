@@ -96,6 +96,15 @@ public final class MultipartUploader {
                 requestedChunkSize
         );
 
+        if (session.optBoolean(
+                "_multipart_unavailable",
+                false
+        )) {
+            throw new IOException(
+                    "OpenList 当前存储驱动不支持 multipart"
+            );
+        }
+
         String uploadId = session.optString("upload_id", "");
         if (uploadId.isEmpty()) {
             throw new IOException(
@@ -695,10 +704,12 @@ public final class MultipartUploader {
         JSONObject data =
                 json.optJSONObject("data");
 
+        // The current OpenList frontend treats data:null as an explicit
+        // "multipart unavailable" response and falls back to /fs/put.
         if (data == null) {
-            throw new IOException(
-                    "OpenList 分片初始化没有 data"
-            );
+            JSONObject empty = new JSONObject();
+            empty.put("_multipart_unavailable", true);
+            return empty;
         }
 
         return data;
