@@ -10,12 +10,15 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.OpenableColumns;
 import android.view.Gravity;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.ProgressBar;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
@@ -45,6 +48,11 @@ public class MainActivity extends Activity {
     public static final String KEY_LAST_URL = "last_url";
     public static final String KEY_LAST_NAME = "last_name";
     public static final String KEY_HISTORY = "upload_history";
+    public static final String KEY_CHUNK_SIZE_MB = "chunk_size_mb";
+    public static final String KEY_CHUNK_PARALLEL = "chunk_parallel";
+    public static final String KEY_FILE_PARALLEL = "file_parallel";
+    public static final String KEY_LARGE_FILE_THRESHOLD_MB = "large_file_threshold_mb";
+    public static final String KEY_UPLOAD_PROGRESS = "upload_progress";
     public static final String EXTRA_URIS = "uris";
 
     private static final int REQUEST_POST_NOTIFICATIONS = 1001;
@@ -53,11 +61,16 @@ public class MainActivity extends Activity {
     private EditText baseUrlInput;
     private EditText tokenInput;
     private EditText dirInput;
+    private EditText chunkSizeInput;
+    private EditText chunkParallelInput;
+    private EditText fileParallelInput;
+    private EditText largeFileThresholdInput;
     private CheckBox overwriteBox;
     private TextView incomingText;
     private TextView statusText;
     private TextView lastLinkText;
     private TextView historyText;
+    private LinearLayout uploadProgressContainer;
     private Button uploadButton;
     private Button testButton;
     private Button copyButton;
@@ -65,6 +78,14 @@ public class MainActivity extends Activity {
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final List<Uri> pendingUris = new ArrayList<>();
+    private final Handler progressHandler = new Handler(Looper.getMainLooper());
+    private final Runnable progressRefreshRunnable = new Runnable() {
+        @Override
+        public void run() {
+            refreshUploadProgress();
+            progressHandler.postDelayed(this, 500L);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -80,6 +101,13 @@ public class MainActivity extends Activity {
         super.onResume();
         refreshLastLink();
         refreshHistory();
+        startProgressPolling();
+    }
+
+    @Override
+    protected void onPause() {
+        stopProgressPolling();
+        super.onPause();
     }
 
     @Override
@@ -91,6 +119,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        stopProgressPolling();
         executor.shutdownNow();
         super.onDestroy();
     }
@@ -130,6 +159,28 @@ public class MainActivity extends Activity {
         dirInput = input("/uploads");
         root.addView(dirInput, matchWrap());
 
+        root.addView(label("分片大小（MiB，1-64）"));
+        chunkSizeInput = input("8");
+        root.addView(chunkSizeInput, matchWrap());
+
+        root.addView(label("每个文件并行分片数（1-8）"));
+        chunkParallelInput = input("4");
+        root.addView(chunkParallelInput, matchWrap());
+
+        root.addView(label("同时上传文件数（1-4）"));
+        fileParallelInput = input("2");
+        root.addView(fileParallelInput, matchWrap());
+
+        root.addView(label("大文件分片阈值（MiB，1-1024）"));
+        largeFileThresholdInput = input("8");
+        root.addView(largeFileThresholdInput, matchWrap());
+
+        TextView parallelHint = new TextView(this);
+        parallelHint.setText("总并发连接≈同时上传文件数 × 每文件并行分片数，过大可能增加内存和服务器压力");
+        parallelHint.setTextSize(12);
+        parallelHint.setPadding(dp(2), dp(2), 0, dp(8));
+        root.addView(parallelHint, matchWrap());
+
         overwriteBox = new CheckBox(this);
         overwriteBox.setText("同名文件直接覆盖（关闭时自动追加时间戳）");
         root.addView(overwriteBox, matchWrap());
@@ -155,6 +206,11 @@ public class MainActivity extends Activity {
         statusText.setTextSize(14);
         statusText.setPadding(0, dp(4), 0, dp(14));
         root.addView(statusText, matchWrap());
+
+        root.addView(label("上传进度"));
+        uploadProgressContainer = new LinearLayout(this);
+        uploadProgressContainer.setOrientation(LinearLayout.VERTICAL);
+        root.addView(uploadProgressContainer, matchWrap());
 
         root.addView(label("最近一次直链"));
         lastLinkText = new TextView(this);
@@ -228,18 +284,61 @@ public class MainActivity extends Activity {
         baseUrlInput.setText(p.getString(KEY_BASE, ""));
         tokenInput.setText(p.getString(KEY_TOKEN, ""));
         dirInput.setText(p.getString(KEY_DIR, "/uploads"));
+        chunkSizeInput.setText(Integer.toString(p.getInt(KEY_CHUNK_SIZE_MB, 8)));
+        chunkParallelInput.setText(Integer.toString(p.getInt(KEY_CHUNK_PARALLEL, 4)));
+        fileParallelInput.setText(Integer.toString(p.getInt(KEY_FILE_PARALLEL, 2)));
+        largeFileThresholdInput.setText(Integer.toString(p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 8)));
         overwriteBox.setChecked(p.getBoolean(KEY_OVERWRITE, false));
         refreshLastLink();
         refreshHistory();
     }
 
-    private void saveConfig() {
+    private boolean saveConfig() {
+        int chunkSizeMb = parseIntInRange(chunkSizeInput, 8, 1, 64);
+        int chunkParallel = parseIntInRange(chunkParallelInput, 4, 1, 8);
+        int fileParallel = parseIntInRange(fileParallelInput, 2, 1, 4);
+        int thresholdMb = parseIntInRange(largeFileThresholdInput, 8, 1, 1024);
+
+        if (chunkSizeMb < 1 || chunkParallel < 1 ||
+                fileParallel < 1 || thresholdMb < 1) {
+            return false;
+        }
+
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
                 .putString(KEY_BASE, baseUrlInput.getText().toString().trim())
                 .putString(KEY_TOKEN, tokenInput.getText().toString().trim())
                 .putString(KEY_DIR, normalizeDir(dirInput.getText().toString()))
+                .putInt(KEY_CHUNK_SIZE_MB, chunkSizeMb)
+                .putInt(KEY_CHUNK_PARALLEL, chunkParallel)
+                .putInt(KEY_FILE_PARALLEL, fileParallel)
+                .putInt(KEY_LARGE_FILE_THRESHOLD_MB, thresholdMb)
                 .putBoolean(KEY_OVERWRITE, overwriteBox.isChecked())
                 .apply();
+
+        return true;
+    }
+
+    private int parseIntInRange(
+            EditText input,
+            int fallback,
+            int min,
+            int max
+    ) {
+        try {
+            int value = Integer.parseInt(
+                    input.getText().toString().trim()
+            );
+
+            if (value < min || value > max) {
+                input.setError("请输入 " + min + "-" + max);
+                return -1;
+            }
+
+            return value;
+        } catch (Exception e) {
+            input.setError("请输入整数");
+            return -1;
+        }
     }
 
     private void handleIntent(Intent intent) {
@@ -345,7 +444,10 @@ public class MainActivity extends Activity {
             return;
         }
 
-        saveConfig();
+        if (!saveConfig()) {
+            statusText.setText("上传参数无效，请检查分片配置");
+            return;
+        }
 
         Intent service = new Intent(this, UploadService.class);
         service.putParcelableArrayListExtra(EXTRA_URIS, new ArrayList<>(pendingUris));
@@ -372,7 +474,11 @@ public class MainActivity extends Activity {
     }
 
     private void testConnection() {
-        saveConfig();
+        if (!saveConfig()) {
+            statusText.setText("上传参数无效，请检查分片配置");
+            return;
+        }
+
         String base = normalizedBaseUrl();
         String token = tokenInput.getText().toString().trim();
 
@@ -409,6 +515,103 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> testButton.setEnabled(true));
             }
         });
+    }
+
+    private void startProgressPolling() {
+        progressHandler.removeCallbacks(progressRefreshRunnable);
+        refreshUploadProgress();
+        progressHandler.post(progressRefreshRunnable);
+    }
+
+    private void stopProgressPolling() {
+        progressHandler.removeCallbacks(progressRefreshRunnable);
+    }
+
+    private void refreshUploadProgress() {
+        if (uploadProgressContainer == null) return;
+
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(KEY_UPLOAD_PROGRESS, "");
+
+        uploadProgressContainer.removeAllViews();
+
+        if (raw.isEmpty()) {
+            addProgressEmptyText("当前没有上传任务");
+            return;
+        }
+
+        try {
+            JSONArray files = new JSONArray(raw);
+
+            if (files.length() == 0) {
+                addProgressEmptyText("当前没有上传任务");
+                return;
+            }
+
+            for (int i = 0; i < files.length(); i++) {
+                JSONObject item = files.optJSONObject(i);
+                if (item == null) continue;
+
+                String name = item.optString("name", "upload.bin");
+                String status = item.optString("status", "pending");
+                String detail = item.optString("detail", "");
+                int progress = Math.max(
+                        0,
+                        Math.min(100, item.optInt("progress", 0))
+                );
+
+                TextView title = new TextView(this);
+                title.setText(
+                        name + " · " +
+                                statusText(status) +
+                                " · " +
+                                progress +
+                                "%"
+                );
+                title.setTextSize(14);
+                uploadProgressContainer.addView(title, matchWrap());
+
+                ProgressBar bar = new ProgressBar(
+                        this,
+                        null,
+                        android.R.attr.progressBarStyleHorizontal
+                );
+                bar.setMax(100);
+                bar.setProgress(progress);
+
+                LinearLayout.LayoutParams barParams = matchWrap();
+                barParams.bottomMargin = dp(2);
+                uploadProgressContainer.addView(bar, barParams);
+
+                if (!detail.isEmpty()) {
+                    TextView detailView = new TextView(this);
+                    detailView.setText(detail);
+                    detailView.setTextSize(12);
+                    detailView.setPadding(dp(4), 0, 0, dp(8));
+                    uploadProgressContainer.addView(
+                            detailView,
+                            matchWrap()
+                    );
+                }
+            }
+        } catch (Exception e) {
+            addProgressEmptyText("上传进度读取失败");
+        }
+    }
+
+    private void addProgressEmptyText(String text) {
+        TextView empty = new TextView(this);
+        empty.setText(text);
+        empty.setTextSize(13);
+        empty.setPadding(0, 0, 0, dp(10));
+        uploadProgressContainer.addView(empty, matchWrap());
+    }
+
+    private String statusText(String status) {
+        if ("uploading".equals(status)) return "上传中";
+        if ("completed".equals(status)) return "完成";
+        if ("failed".equals(status)) return "失败";
+        return "等待";
     }
 
     private void refreshLastLink() {
