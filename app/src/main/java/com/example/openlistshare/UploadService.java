@@ -69,7 +69,12 @@ public class UploadService extends Service {
         );
 
         executor.execute(() -> {
-            uploadAll(uris);
+            try {
+                uploadAll(uris);
+            } finally {
+                detachForeground();
+                stopSelf(startId);
+            }
         });
 
         return START_NOT_STICKY;
