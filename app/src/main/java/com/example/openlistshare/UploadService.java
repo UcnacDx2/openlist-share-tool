@@ -1337,14 +1337,14 @@ public class UploadService extends Service {
         if (body == null || body.isEmpty()) return "无返回内容";
 
         String compact = body
-                .replace("\\r", "")
-                .replace("\\n", " ")
+                .replace("\r", "")
+                .replace("\n", " ")
                 .replaceAll("\\s+", " ")
                 .trim();
 
         if (compact.startsWith("<!doctype") ||
                 compact.startsWith("<html") ||
-                compact.contains("<meta name="generator" content="OpenList"")) {
+                (compact.contains("generator") && compact.contains("OpenList"))) {
             return "服务器返回 OpenList 前端页面，当前服务端未提供 Multipart API；请升级 OpenList 至 v4.2.5 或更高版本";
         }
 
