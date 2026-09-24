@@ -18,7 +18,6 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
@@ -29,8 +28,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import okhttp3.Call;
-import okhttp3.MediaType;
 import okhttp3.Callback;
+import okhttp3.MediaType;
 import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -202,6 +201,8 @@ public final class MultipartUploader {
             List<Future<?>> futures = new ArrayList<>();
             AtomicReference<Exception> fatal =
                     new AtomicReference<>(null);
+            AtomicReference<Boolean> completedEarly =
+                    new AtomicReference<>(false);
 
             try {
                 for (int worker = 0;
@@ -213,7 +214,9 @@ public final class MultipartUploader {
                                     int pos =
                                             next.getAndIncrement();
 
-                                    if (pos >= missing.size()) {
+                                    if (pos >= missing.size() ||
+                                            Boolean.TRUE.equals(completedEarly.get()) ||
+                                            fatal.get() != null) {
                                         return;
                                     }
 
@@ -237,7 +240,9 @@ public final class MultipartUploader {
                                                 attemptLoaded,
                                                 lastReportAt,
                                                 listener,
-                                                inflight
+                                                inflight,
+                                                completedEarly,
+                                                fatal
                                         );
                                     } catch (Exception e) {
                                         fatal.compareAndSet(
@@ -299,7 +304,9 @@ public final class MultipartUploader {
             ConcurrentMap<Integer, AtomicLong> attemptLoaded,
             AtomicLong lastReportAt,
             Listener listener,
-            int inflight
+            int inflight,
+            AtomicReference<Boolean> completedEarly,
+            AtomicReference<Exception> fatal
     ) throws Exception {
         long chunkLength =
                 Math.min(
@@ -307,15 +314,17 @@ public final class MultipartUploader {
                         fileSize - chunkIndex * chunkSize
                 );
 
-        int retries = 0;
+        int flowRetries = 0;
 
         while (true) {
-            AtomicLong loaded =
-                    new AtomicLong(0L);
+            if (Boolean.TRUE.equals(completedEarly.get()) ||
+                    fatal.get() != null) {
+                return;
+            }
 
+            AtomicLong loaded = new AtomicLong(0L);
             attemptLoaded.put(chunkIndex, loaded);
 
-            boolean requestFinished = false;
             try {
                 Response response = executeChunk(
                         base,
@@ -350,14 +359,10 @@ public final class MultipartUploader {
                     }
                 }
 
-                requestFinished = true;
-
                 if (apiCode == 200 &&
                         httpCode >= 200 &&
                         httpCode < 300) {
-                    long sent =
-                            loaded.getAndSet(0L);
-
+                    long sent = loaded.getAndSet(0L);
                     if (sent != 0L) {
                         inFlightBytes.addAndGet(-sent);
                     }
@@ -381,25 +386,34 @@ public final class MultipartUploader {
                                     "路并行"
                     );
 
+                    if (json != null) {
+                        JSONObject data =
+                                json.optJSONObject("data");
+                        if (data != null &&
+                                "completed".equals(
+                                        data.optString(
+                                                "state",
+                                                ""
+                                        ))) {
+                            completedEarly.set(true);
+                        }
+                    }
                     return;
                 }
 
-                if (apiCode == 429 ||
-                        apiCode == 409 ||
-                        httpCode == 408 ||
-                        httpCode == 429 ||
-                        httpCode >= 500) {
-                    retries++;
-
-                    if (retries > MAX_FLOW_RETRIES) {
+                // Match OpenList frontend: 429/409 are flow-control signals,
+                // not upload failures. The server-side window already waits
+                // for storage consumption; retry patiently.
+                if (apiCode == 429 || apiCode == 409) {
+                    flowRetries++;
+                    if (flowRetries > MAX_FLOW_RETRIES) {
                         throw new IOException(
                                 "第 " +
                                         (chunkIndex + 1) +
                                         " 片等待服务器过久"
                         );
                     }
-
-                    sleepBackoff(retries);
+                    sleepFlowBackoff(true, flowRetries);
                     continue;
                 }
 
@@ -416,33 +430,25 @@ public final class MultipartUploader {
                                 )
                 );
             } catch (IOException networkError) {
-                if (requestFinished) {
-                    throw networkError;
-                }
-
-                JSONObject status =
-                        safeStatus(
+                // A transport-level failure is ambiguous: the server may
+                // already have accepted the chunk. Probe the session first,
+                // exactly like the official frontend.
+                StatusResult status =
+                        probeStatus(
                                 base,
                                 token,
                                 uploadId
                         );
 
-                if (isCompleted(status)) {
-                    long current =
-                            Math.max(
-                                    fileSize,
-                                    ackedBytes.get()
-                            );
-                    peakBytes.accumulateAndGet(
-                            current,
-                            Math::max
-                    );
+                if (status.httpCode == 404 ||
+                        isCompleted(status.data)) {
+                    completedEarly.set(true);
                     return;
                 }
 
-                if (isFailed(status)) {
+                if (isFailed(status.data)) {
                     throw new IOException(
-                            status.optString(
+                            status.data.optString(
                                     "error",
                                     "OpenList 分片上传失败"
                             ),
@@ -450,9 +456,8 @@ public final class MultipartUploader {
                     );
                 }
 
-                retries++;
-
-                if (retries > MAX_FLOW_RETRIES) {
+                flowRetries++;
+                if (flowRetries > MAX_FLOW_RETRIES) {
                     throw new IOException(
                             "第 " +
                                     (chunkIndex + 1) +
@@ -461,15 +466,12 @@ public final class MultipartUploader {
                     );
                 }
 
-                sleepBackoff(retries);
+                sleepFlowBackoff(false, flowRetries);
             } finally {
-                long sent =
-                        loaded.getAndSet(0L);
-
+                long sent = loaded.getAndSet(0L);
                 if (sent != 0L) {
                     inFlightBytes.addAndGet(-sent);
                 }
-
                 attemptLoaded.remove(chunkIndex);
             }
         }
@@ -536,60 +538,83 @@ public final class MultipartUploader {
             long size,
             Listener listener
     ) throws Exception {
-        ExecutorService completeExecutor =
-                Executors.newSingleThreadExecutor();
+        Request request = new Request.Builder()
+                .url(base + "/api/fs/multipart/complete")
+                .post(EMPTY_BODY)
+                .header("Authorization", token)
+                .header("X-Upload-Id", uploadId)
+                .build();
 
-        Future<Response> future =
-                completeExecutor.submit(
-                        () -> multipartComplete(
-                                base,
-                                token,
-                                uploadId
-                        )
-                );
+        Call call = client.newCall(request);
+        AtomicReference<Response> responseRef =
+                new AtomicReference<>(null);
+        AtomicReference<Exception> errorRef =
+                new AtomicReference<>(null);
+        AtomicReference<Boolean> settled =
+                new AtomicReference<>(false);
+
+        call.enqueue(new Callback() {
+            @Override
+            public void onFailure(
+                    Call call,
+                    IOException e
+            ) {
+                errorRef.set(e);
+                settled.set(true);
+            }
+
+            @Override
+            public void onResponse(
+                    Call call,
+                    Response response
+            ) {
+                responseRef.set(response);
+                settled.set(true);
+            }
+        });
 
         try {
-            while (!future.isDone()) {
-                JSONObject status =
-                        safeStatus(
+            while (!Boolean.TRUE.equals(settled.get())) {
+                Thread.sleep(2000L);
+
+                if (Boolean.TRUE.equals(settled.get())) {
+                    break;
+                }
+
+                StatusResult status =
+                        probeStatus(
                                 base,
                                 token,
                                 uploadId
                         );
 
-                if (status != null) {
-                    String state =
-                            status.optString(
-                                    "state",
-                                    ""
-                            );
+                if (status.httpCode == 404 ||
+                        isCompleted(status.data)) {
+                    call.cancel();
+                    listener.onProgress(
+                            size,
+                            100,
+                            "上传完成"
+                    );
+                    return;
+                }
 
-                    if ("completed".equals(state)) {
-                        future.cancel(true);
-                        listener.onProgress(
-                                size,
-                                100,
-                                "上传完成"
-                        );
-                        return;
-                    }
+                if (isFailed(status.data)) {
+                    call.cancel();
+                    throw new IOException(
+                            status.data.optString(
+                                    "error",
+                                    "OpenList 后端处理失败"
+                            )
+                    );
+                }
 
-                    if (state.startsWith("failed") ||
-                            "aborted".equals(state)) {
-                        throw new IOException(
-                                status.optString(
-                                        "error",
-                                        "OpenList 后端处理失败"
-                                )
-                        );
-                    }
-
+                if (status.data != null) {
                     double storage =
-                            status.optDouble(
+                            status.data.optDouble(
                                     "storage_progress",
                                     -1.0
                             );
-
                     if (storage >= 0.0) {
                         listener.onProgress(
                                 size,
@@ -610,47 +635,108 @@ public final class MultipartUploader {
                         );
                     }
                 }
+            }
+
+            Response response = responseRef.get();
+
+            if (response != null) {
+                String body = responseBody(response);
+                int apiCode = response.code();
+                JSONObject json = null;
+
+                if (!body.isEmpty()) {
+                    try {
+                        json = new JSONObject(body);
+                        apiCode = json.optInt(
+                                "code",
+                                apiCode
+                        );
+                    } catch (Exception ignored) {
+                    }
+                }
+
+                if (apiCode == 200 &&
+                        response.code() >= 200 &&
+                        response.code() < 300) {
+                    listener.onProgress(
+                            size,
+                            100,
+                            "上传完成"
+                    );
+                    return;
+                }
+
+                throw new IOException(
+                        "OpenList 分片完成失败：" +
+                                messageFrom(
+                                        json,
+                                        body,
+                                        response.code()
+                                )
+                );
+            }
+
+            // Complete itself did not return successfully. Keep polling the
+            // session until the server-side storage pipeline settles.
+            Exception transportError = errorRef.get();
+
+            while (true) {
+                StatusResult status =
+                        probeStatus(
+                                base,
+                                token,
+                                uploadId
+                        );
+
+                if (status.httpCode == 404 ||
+                        isCompleted(status.data)) {
+                    listener.onProgress(
+                            size,
+                            100,
+                            "上传完成"
+                    );
+                    return;
+                }
+
+                if (isFailed(status.data)) {
+                    throw new IOException(
+                            status.data.optString(
+                                    "error",
+                                    transportError == null
+                                            ? "OpenList 后端处理失败"
+                                            : transportError.getMessage()
+                            ),
+                            transportError
+                    );
+                }
+
+                if (status.data != null) {
+                    double storage =
+                            status.data.optDouble(
+                                    "storage_progress",
+                                    -1.0
+                            );
+                    if (storage >= 0.0) {
+                        listener.onProgress(
+                                size,
+                                99,
+                                "服务器正在处理 · 后端 " +
+                                        String.format(
+                                                java.util.Locale.US,
+                                                "%.1f",
+                                                storage
+                                        ) +
+                                        "%"
+                        );
+                    }
+                }
 
                 Thread.sleep(2000L);
             }
-
-            Response response = future.get();
-            String body = responseBody(response);
-            int apiCode = response.code();
-
-            JSONObject json = null;
-            if (!body.isEmpty()) {
-                try {
-                    json = new JSONObject(body);
-                    apiCode = json.optInt(
-                            "code",
-                            apiCode
-                    );
-                } catch (Exception ignored) {
-                }
-            }
-
-            if (apiCode == 200 &&
-                    response.code() >= 200 &&
-                    response.code() < 300) {
-                listener.onProgress(
-                        size,
-                        100,
-                        "上传完成"
-                );
-                return;
-            }
-
-            throw new IOException(
-                    "OpenList 分片完成失败：" +
-                            messageFrom(
-                                    json,
-                                    body,
-                                    response.code()
-                            )
-            );
         } finally {
-            completeExecutor.shutdownNow();
+            if (!Boolean.TRUE.equals(settled.get())) {
+                call.cancel();
+            }
         }
     }
 
@@ -752,7 +838,7 @@ public final class MultipartUploader {
         return client.newCall(request).execute();
     }
 
-    private JSONObject safeStatus(
+    private StatusResult probeStatus(
             String base,
             String token,
             String uploadId
@@ -775,22 +861,40 @@ public final class MultipartUploader {
             String body = responseBody(response);
 
             if (response.code() == 404) {
-                return null;
+                return new StatusResult(404, null);
             }
 
             if (!response.isSuccessful() ||
                     body.isEmpty()) {
-                return null;
+                return new StatusResult(
+                        response.code(),
+                        null
+                );
             }
 
             JSONObject json = new JSONObject(body);
-            if (json.optInt("code", response.code()) != 200) {
-                return null;
+            int apiCode =
+                    json.optInt(
+                            "code",
+                            response.code()
+                    );
+
+            if (apiCode != 200) {
+                return new StatusResult(
+                        apiCode,
+                        null
+                );
             }
 
-            return json.optJSONObject("data");
+            return new StatusResult(
+                    response.code(),
+                    json.optJSONObject("data")
+            );
         } catch (Exception ignored) {
-            return null;
+            return new StatusResult(
+                    -1,
+                    null
+            );
         }
     }
 
@@ -897,20 +1001,19 @@ public final class MultipartUploader {
         }
     }
 
-    private void sleepBackoff(int retry) throws InterruptedException {
+    private void sleepFlowBackoff(
+            boolean serverFlowControl,
+            int retry
+    ) throws InterruptedException {
         long delay =
-                Math.min(
-                        RETRY_MAX_MS,
-                        RETRY_BASE_MS * Math.max(1, retry)
-                );
+                serverFlowControl
+                        ? RETRY_BASE_MS
+                        : Math.min(
+                                RETRY_MAX_MS,
+                                1200L * retry
+                        );
 
-        long jitter =
-                (long) (
-                        Math.random() *
-                                Math.max(1L, delay / 4L)
-                );
-
-        Thread.sleep(delay + jitter);
+        Thread.sleep(delay);
     }
 
     private String responseBody(Response response)
@@ -971,6 +1074,16 @@ public final class MultipartUploader {
                 ) {
                 }
             };
+
+    private static final class StatusResult {
+        final int httpCode;
+        final JSONObject data;
+
+        StatusResult(int httpCode, JSONObject data) {
+            this.httpCode = httpCode;
+            this.data = data;
+        }
+    }
 
     private interface ProgressSink {
         void onWrite(long delta, long loaded);
