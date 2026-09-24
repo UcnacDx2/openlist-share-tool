@@ -28,6 +28,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 
 import okhttp3.Call;
+import okhttp3.MediaType;
 import okhttp3.Callback;
 import okhttp3.Dispatcher;
 import okhttp3.OkHttpClient;
@@ -932,6 +933,13 @@ public final class MultipartUploader {
     private static final RequestBody EMPTY_BODY =
             new RequestBody() {
                 @Override
+                public MediaType contentType() {
+                    return MediaType.parse(
+                            "application/octet-stream"
+                    );
+                }
+
+                @Override
                 public long contentLength() {
                     return 0L;
                 }
@@ -964,6 +972,13 @@ public final class MultipartUploader {
             this.offset = offset;
             this.length = length;
             this.progress = progress;
+        }
+
+        @Override
+        public MediaType contentType() {
+            return MediaType.parse(
+                    "application/octet-stream"
+            );
         }
 
         @Override
