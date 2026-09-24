@@ -42,6 +42,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
@@ -916,26 +918,205 @@ public class UploadService extends Service {
 
         ExecutorService chunkExecutor =
                 Executors.newFixedThreadPool(chunkParallel);
+        ExecutorService readerExecutor =
+                Executors.newSingleThreadExecutor();
         CompletionService<ChunkUploadResult> completion =
                 new ExecutorCompletionService<>(chunkExecutor);
-        List<Future<ChunkUploadResult>> futures = new ArrayList<>();
 
         AtomicLong transferredBytes = new AtomicLong(0);
-        int submitted = 0;
+        AtomicInteger submittedCount = new AtomicInteger(0);
+        AtomicReference<Exception> readerError =
+                new AtomicReference<>(null);
+
+        // Keep the network workers fed by reading ahead on a dedicated thread.
+        // Bound extra buffered chunks so tuning chunk size does not create
+        // an unbounded memory spike.
+        long maxPrefetchBytes = 128L * 1024L * 1024L;
+        int prefetchChunks = (int) Math.max(
+                1L,
+                Math.min(
+                        (long) chunkParallel,
+                        Math.max(
+                                1L,
+                                maxPrefetchBytes / chunkSize
+                        )
+                )
+        );
+        int pipelineWindow = Math.min(
+                totalChunks,
+                chunkParallel + prefetchChunks
+        );
+
+        Semaphore pipelineSlots =
+                new Semaphore(pipelineWindow);
+
+        Future<?> readerFuture = null;
         int completed = 0;
         boolean allDone = false;
 
-        try (InputStream raw = getContentResolver().openInputStream(uri)) {
-            if (raw == null) {
-                throw new IOException("无法读取文件");
-            }
+        try {
+            readerFuture = readerExecutor.submit(() -> {
+                try (InputStream raw =
+                             getContentResolver().openInputStream(uri)) {
+                    if (raw == null) {
+                        throw new IOException("无法读取文件");
+                    }
 
-            InputStream in = new BufferedInputStream(raw, 128 * 1024);
+                    InputStream in =
+                            new BufferedInputStream(
+                                    raw,
+                                    128 * 1024
+                            );
 
-            while (submitted < totalChunks) {
-                while (submitted - completed >= chunkParallel) {
-                    ChunkUploadResult result = awaitChunk(completion);
+                    try {
+                        for (int chunkIndex = 0;
+                                chunkIndex < totalChunks;
+                                chunkIndex++) {
+                            pipelineSlots.acquire();
+
+                            boolean submitted = false;
+
+                            try {
+                                long chunkOffset =
+                                        (long) chunkIndex * chunkSize;
+                                int expected = (int) Math.min(
+                                        chunkSize,
+                                        size - chunkOffset
+                                );
+
+                                if (expected <= 0) {
+                                    throw new IOException(
+                                            "OpenList 返回的 total_chunks 与文件大小不匹配"
+                                    );
+                                }
+
+                                byte[] buffer =
+                                        new byte[expected];
+
+                                int actual = readChunk(
+                                        in,
+                                        buffer,
+                                        expected
+                                );
+
+                                if (actual != expected) {
+                                    throw new IOException(
+                                            "文件读取不完整：第 " +
+                                                    (chunkIndex + 1) +
+                                                    "/" +
+                                                    totalChunks +
+                                                    " 片，期望 " +
+                                                    expected +
+                                                    " 字节，实际 " +
+                                                    actual +
+                                                    " 字节"
+                                    );
+                                }
+
+                                final byte[] chunk = buffer;
+                                final int chunkLength = actual;
+                                final int finalChunkIndex = chunkIndex;
+
+                                completion.submit(() -> {
+                                    Exception lastError = null;
+
+                                    for (int attempt = 1;
+                                            attempt <= CHUNK_RETRIES;
+                                            attempt++) {
+                                        try {
+                                            multipartChunk(
+                                                    base,
+                                                    token,
+                                                    uploadId,
+                                                    finalChunkIndex,
+                                                    chunk,
+                                                    chunkLength,
+                                                    delta -> {
+                                                        BatchProgress batchProgress =
+                                                                activeBatchProgress;
+
+                                                        if (batchProgress != null) {
+                                                            batchProgress.transferred
+                                                                    .addAndGet(
+                                                                            index,
+                                                                            delta
+                                                                    );
+                                                        }
+
+                                                        transferredBytes
+                                                                .addAndGet(
+                                                                        delta
+                                                                );
+                                                    }
+                                            );
+
+                                            return new ChunkUploadResult(
+                                                    finalChunkIndex,
+                                                    chunkLength
+                                            );
+                                        } catch (Exception e) {
+                                            lastError = e;
+
+                                            if (attempt < CHUNK_RETRIES) {
+                                                try {
+                                                    Thread.sleep(1000L);
+                                                } catch (InterruptedException interrupted) {
+                                                    Thread.currentThread().interrupt();
+                                                    throw new IOException(
+                                                            "上传被中断",
+                                                            interrupted
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    throw new IOException(
+                                            "第 " +
+                                                    (finalChunkIndex + 1) +
+                                                    "/" +
+                                                    totalChunks +
+                                                    " 片上传失败：" +
+                                                    friendlyError(lastError)
+                                    );
+                                });
+
+                                submittedCount.incrementAndGet();
+                                submitted = true;
+                            } finally {
+                                if (!submitted) {
+                                    pipelineSlots.release();
+                                }
+                            }
+                        }
+                    } finally {
+                        in.close();
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } catch (Exception e) {
+                    readerError.set(e);
+                }
+            });
+
+            while (completed < totalChunks) {
+                Exception error = readerError.get();
+                int submitted = submittedCount.get();
+
+                if (error != null && completed >= submitted) {
+                    throw error;
+                }
+
+                Future<ChunkUploadResult> future =
+                        completion.poll(
+                                250L,
+                                TimeUnit.MILLISECONDS
+                        );
+
+                if (future != null) {
+                    ChunkUploadResult result = future.get();
                     completed++;
+                    pipelineSlots.release();
 
                     updateProgress(
                             index,
@@ -943,7 +1124,9 @@ public class UploadService extends Service {
                             displayName,
                             (int) Math.min(
                                     99L,
-                                    transferredBytes.get() * 100L / size
+                                    transferredBytes.get() *
+                                            100L /
+                                            size
                             ),
                             "分片 " +
                                     (result.index + 1) +
@@ -954,136 +1137,51 @@ public class UploadService extends Service {
                                     "路并行",
                             "uploading"
                     );
-                }
+                } else if (readerFuture.isDone() &&
+                        completed >= submittedCount.get()) {
+                    error = readerError.get();
 
-                int chunkIndex = submitted;
-                long chunkOffset = (long) chunkIndex * chunkSize;
-                int expected = (int) Math.min(
-                        chunkSize,
-                        size - chunkOffset
-                );
+                    if (error != null) {
+                        throw error;
+                    }
 
-                if (expected <= 0) {
                     throw new IOException(
-                            "OpenList 返回的 total_chunks 与文件大小不匹配"
-                    );
-                }
-
-                byte[] buffer = new byte[expected];
-                int actual = readChunk(in, buffer, expected);
-
-                if (actual != expected) {
-                    throw new IOException(
-                            "文件读取不完整：第 " +
-                                    (chunkIndex + 1) +
+                            "分片读取线程提前结束：已提交 " +
+                                    submittedCount.get() +
                                     "/" +
                                     totalChunks +
-                                    " 片，期望 " +
-                                    expected +
-                                    " 字节，实际 " +
-                                    actual +
-                                    " 字节"
+                                    " 片"
                     );
                 }
-
-                final byte[] chunk = buffer;
-                final int chunkLength = actual;
-
-                futures.add(
-                        completion.submit(() -> {
-                            Exception lastError = null;
-
-                            for (int attempt = 1; attempt <= CHUNK_RETRIES; attempt++) {
-                                try {
-                                    multipartChunk(
-                                            base,
-                                            token,
-                                            uploadId,
-                                            chunkIndex,
-                                            chunk,
-                                            chunkLength,
-                                            delta -> {
-                                                BatchProgress batchProgress =
-                                                        activeBatchProgress;
-
-                                                if (batchProgress != null) {
-                                                    batchProgress.transferred
-                                                            .addAndGet(
-                                                                    index,
-                                                                    delta
-                                                            );
-                                                }
-
-                                                transferredBytes.addAndGet(delta);
-                                            }
-                                    );
-
-                                    return new ChunkUploadResult(
-                                            chunkIndex,
-                                            chunkLength
-                                    );
-                                } catch (Exception e) {
-                                    lastError = e;
-
-                                    if (attempt < CHUNK_RETRIES) {
-                                        try {
-                                            Thread.sleep(1000L);
-                                        } catch (InterruptedException interrupted) {
-                                            Thread.currentThread().interrupt();
-                                            throw new IOException(
-                                                    "上传被中断",
-                                                    interrupted
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-
-                            throw new IOException(
-                                    "第 " +
-                                            (chunkIndex + 1) +
-                                            "/" +
-                                            totalChunks +
-                                            " 片上传失败：" +
-                                            friendlyError(lastError)
-                            );
-                        })
-                );
-
-                submitted++;
             }
 
-            while (completed < submitted) {
-                ChunkUploadResult result = awaitChunk(completion);
-                completed++;
+            Exception error = readerError.get();
+            if (error != null) {
+                throw error;
+            }
 
-                updateProgress(
-                        index,
-                        total,
-                        displayName,
-                        (int) Math.min(
-                                99L,
-                                transferredBytes.get() * 100L / size
-                        ),
-                        "分片 " +
-                                (result.index + 1) +
+            if (submittedCount.get() != totalChunks ||
+                    completed != totalChunks) {
+                throw new IOException(
+                        "分片上传未完成：已提交 " +
+                                submittedCount.get() +
                                 "/" +
                                 totalChunks +
-                                " · " +
-                                chunkParallel +
-                                "路并行",
-                        "uploading"
+                                "，已完成 " +
+                                completed +
+                                "/" +
+                                totalChunks
                 );
             }
 
+            readerFuture.get();
             allDone = true;
         } finally {
-            if (!allDone) {
-                for (Future<ChunkUploadResult> future : futures) {
-                    future.cancel(true);
-                }
+            if (!allDone && readerFuture != null) {
+                readerFuture.cancel(true);
             }
 
+            readerExecutor.shutdownNow();
             chunkExecutor.shutdownNow();
         }
 
