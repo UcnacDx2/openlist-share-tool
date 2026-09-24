@@ -66,6 +66,8 @@ public class UploadService extends Service {
     private static final int PROGRESS_WRITE_SIZE = 128 * 1024;
     private static final long AS_TASK_POLL_MS = 2000L;
     private static final int AS_TASK_MAX_POLLS = 900;
+    private static final int REMOTE_API_RETRIES = 6;
+    private static final long REMOTE_API_RETRY_BASE_MS = 1500L;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private volatile BatchProgress activeBatchProgress;
@@ -684,6 +686,7 @@ public class UploadService extends Service {
                 throw new IOException(
                         "检查重名失败 HTTP " +
                                 result.httpCode +
+                                formatHttpDiagnostics(result) +
                                 "：" +
                                 safeMessage(result.body)
                 );
@@ -1106,7 +1109,7 @@ public class UploadService extends Service {
                         .toString();
 
         HttpResult result =
-                requestJson(
+                requestJsonWithRetry(
                         "POST",
                         base + "/api/fs/get",
                         token,
@@ -1517,7 +1520,7 @@ public class UploadService extends Service {
         req.put("path", target);
         req.put("password", "");
 
-        HttpResult result = requestJson(
+        HttpResult result = requestJsonWithRetry(
                 "POST",
                 base + "/api/fs/get",
                 token,
@@ -1528,6 +1531,7 @@ public class UploadService extends Service {
             throw new IOException(
                     "获取 OpenList 直链失败 HTTP " +
                             result.httpCode +
+                            formatHttpDiagnostics(result) +
                             "：" +
                             safeMessage(result.body)
             );
@@ -1955,6 +1959,68 @@ public class UploadService extends Service {
                 .getString(MainActivity.KEY_LAST_URL, "");
     }
 
+    private HttpResult requestJsonWithRetry(
+            String method,
+            String urlText,
+            String token,
+            String jsonBody
+    ) throws Exception {
+        Exception lastError = null;
+
+        for (int attempt = 0; attempt < REMOTE_API_RETRIES; attempt++) {
+            try {
+                HttpResult result =
+                        requestJson(
+                                method,
+                                urlText,
+                                token,
+                                jsonBody
+                        );
+
+                if (!isTransientRemoteError(result.httpCode) ||
+                        attempt == REMOTE_API_RETRIES - 1) {
+                    return result;
+                }
+
+                sleepRemoteApiRetry(attempt);
+            } catch (Exception e) {
+                lastError = e;
+
+                if (attempt == REMOTE_API_RETRIES - 1) {
+                    throw e;
+                }
+
+                sleepRemoteApiRetry(attempt);
+            }
+        }
+
+        if (lastError != null) {
+            throw lastError;
+        }
+
+        throw new IOException("远端 API 请求失败");
+    }
+
+    private boolean isTransientRemoteError(int code) {
+        return code == 429 ||
+                code == 502 ||
+                code == 503 ||
+                code == 504 ||
+                (code >= 520 && code <= 526);
+    }
+
+    private void sleepRemoteApiRetry(int attempt)
+            throws InterruptedException {
+        long delay =
+                Math.min(
+                        10000L,
+                        REMOTE_API_RETRY_BASE_MS *
+                                (1L << Math.min(attempt, 4))
+                );
+
+        Thread.sleep(delay);
+    }
+
     private HttpResult requestJson(
             String method,
             String urlText,
@@ -1989,7 +2055,15 @@ public class UploadService extends Service {
             }
 
             int code = conn.getResponseCode();
-            return new HttpResult(code, readBody(conn));
+            String body = readBody(conn);
+
+            return new HttpResult(
+                    code,
+                    body,
+                    conn.getHeaderField("Content-Type"),
+                    conn.getHeaderField("Server"),
+                    conn.getHeaderField("CF-Ray")
+            );
         } finally {
             if (conn != null) conn.disconnect();
         }
@@ -2149,6 +2223,22 @@ public class UploadService extends Service {
         return s;
     }
 
+    private String formatHttpDiagnostics(HttpResult result) {
+        StringBuilder sb = new StringBuilder();
+
+        if (!result.contentType.isEmpty()) {
+            sb.append(" Content-Type=").append(result.contentType);
+        }
+        if (!result.server.isEmpty()) {
+            sb.append(" Server=").append(result.server);
+        }
+        if (!result.cfRay.isEmpty()) {
+            sb.append(" CF-Ray=").append(result.cfRay);
+        }
+
+        return sb.toString();
+    }
+
     private String safeMessage(String body) {
         if (body == null || body.isEmpty()) return "无返回内容";
 
@@ -2246,10 +2336,22 @@ public class UploadService extends Service {
     private static final class HttpResult {
         final int httpCode;
         final String body;
+        final String contentType;
+        final String server;
+        final String cfRay;
 
-        HttpResult(int httpCode, String body) {
+        HttpResult(
+                int httpCode,
+                String body,
+                String contentType,
+                String server,
+                String cfRay
+        ) {
             this.httpCode = httpCode;
             this.body = body;
+            this.contentType = contentType == null ? "" : contentType;
+            this.server = server == null ? "" : server;
+            this.cfRay = cfRay == null ? "" : cfRay;
         }
     }
 }
