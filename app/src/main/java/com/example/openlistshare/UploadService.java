@@ -1188,19 +1188,114 @@ public class UploadService extends Service {
             chunkExecutor.shutdownNow();
         }
 
-        JSONObject complete = multipartComplete(
-                base,
-                token,
-                uploadId
+        // All chunks are on the OpenList multipart window now. The
+        // complete endpoint may still wait for the storage driver to finish
+        // writing the assembled file, so keep the user informed instead of
+        // appearing stuck at 99%.
+        updateProgress(
+                index,
+                total,
+                displayName,
+                99,
+                "分片已全部上传，服务器正在处理",
+                "uploading"
         );
 
-        String state = complete.optString("state", "");
-        if (!"completed".equals(state)) {
-            String error = complete.optString("error", "");
-            if (error.isEmpty()) {
-                error = "OpenList 返回状态：" + state;
+        ExecutorService completeExecutor =
+                Executors.newSingleThreadExecutor();
+
+        Future<JSONObject> completeFuture = null;
+
+        try {
+            completeFuture = completeExecutor.submit(
+                    () -> multipartComplete(
+                            base,
+                            token,
+                            uploadId
+                    )
+            );
+
+            while (!completeFuture.isDone()) {
+                try {
+                    JSONObject statusData =
+                            multipartStatus(
+                                    base,
+                                    token,
+                                    uploadId
+                            );
+
+                    String state =
+                            statusData.optString("state", "");
+
+                    double storageProgress =
+                            statusData.optDouble(
+                                    "storage_progress",
+                                    -1.0
+                            );
+
+                    String detail =
+                            "分片已全部上传，服务器正在处理";
+
+                    if (storageProgress >= 0.0) {
+                        detail +=
+                                " · 后端 " +
+                                        formatPercent(
+                                                storageProgress
+                                        ) +
+                                        "%";
+                    }
+
+                    if (!state.isEmpty() &&
+                            !"receiving".equals(state)) {
+                        detail += " · " + state;
+                    }
+
+                    updateProgress(
+                            index,
+                            total,
+                            displayName,
+                            99,
+                            detail,
+                            "uploading"
+                    );
+                } catch (Exception ignored) {
+                    // Status is informational only. The completion request
+                    // remains authoritative and is still awaited below.
+                }
+
+                if (!completeFuture.isDone()) {
+                    Thread.sleep(500L);
+                }
             }
-            throw new IOException("分片合并失败：" + error);
+
+            JSONObject complete = completeFuture.get();
+
+            String state =
+                    complete.optString(
+                            "state",
+                            ""
+                    );
+
+            if (!"completed".equals(state)) {
+                String error =
+                        complete.optString(
+                                "error",
+                                ""
+                        );
+
+                if (error.isEmpty()) {
+                    error =
+                            "OpenList 返回状态：" +
+                                    state;
+                }
+
+                throw new IOException(
+                        "分片合并失败：" +
+                                error
+                );
+            }
+        } finally {
+            completeExecutor.shutdownNow();
         }
 
         updateProgress(
@@ -1208,8 +1303,75 @@ public class UploadService extends Service {
                 total,
                 displayName,
                 100,
-                "文件上传完成，正在合并",
+                "文件上传完成",
                 "uploading"
+        );
+    }
+
+    private JSONObject multipartStatus(
+            String base,
+            String token,
+            String uploadId
+    ) throws Exception {
+        HttpResult result = requestJson(
+                "GET",
+                base +
+                        "/api/fs/multipart/status?upload_id=" +
+                        Uri.encode(uploadId),
+                token,
+                ""
+        );
+
+        if (result.httpCode < 200 ||
+                result.httpCode >= 300) {
+            throw new IOException(
+                    "OpenList 分片状态 HTTP " +
+                            result.httpCode +
+                            "：" +
+                            safeMessage(result.body)
+            );
+        }
+
+        JSONObject json =
+                result.body.isEmpty()
+                        ? new JSONObject()
+                        : new JSONObject(result.body);
+
+        int code =
+                json.optInt(
+                        "code",
+                        result.httpCode
+                );
+
+        if (code != 200) {
+            throw new IOException(
+                    "OpenList 分片状态失败 " +
+                            code +
+                            "：" +
+                            json.optString(
+                                    "message",
+                                    result.body
+                            )
+            );
+        }
+
+        JSONObject data =
+                json.optJSONObject("data");
+
+        if (data == null) {
+            throw new IOException(
+                    "OpenList 分片状态没有 data"
+            );
+        }
+
+        return data;
+    }
+
+    private String formatPercent(double value) {
+        return String.format(
+                Locale.US,
+                "%.1f",
+                Math.max(0.0, Math.min(100.0, value))
         );
     }
 
