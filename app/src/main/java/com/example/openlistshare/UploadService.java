@@ -869,14 +869,60 @@ public class UploadService extends Service {
                 }
             }
 
-            int code = conn.getResponseCode();
-            String body = readBody(conn);
+            int code;
+            String body;
+
+            try {
+                code = conn.getResponseCode();
+                body = readBody(conn);
+            } catch (IOException e) {
+                // The request body may already have reached OpenList even when
+                // the proxy drops the final response. Verify the target before
+                // declaring the upload lost.
+                if (isTransientRemoteException(e) &&
+                        waitForFileReadyAfterPutError(
+                                base,
+                                token,
+                                target,
+                                size,
+                                overwrite,
+                                index,
+                                total,
+                                displayName
+                        )) {
+                    return;
+                }
+                throw e;
+            }
 
             if (code < 200 || code >= 300) {
+                if (isTransientRemoteError(code) &&
+                        waitForFileReadyAfterPutError(
+                                base,
+                                token,
+                                target,
+                                size,
+                                overwrite,
+                                index,
+                                total,
+                                displayName
+                        )) {
+                    return;
+                }
+
                 throw new IOException(
                         "OpenList 上传 HTTP " +
                                 code +
                                 "：" +
+                                formatHttpDiagnostics(
+                                        new HttpResult(
+                                                code,
+                                                body,
+                                                conn.getHeaderField("Content-Type"),
+                                                conn.getHeaderField("Server"),
+                                                conn.getHeaderField("CF-Ray")
+                                        )
+                                ) +
                                 safeMessage(body)
                 );
             }
@@ -1041,6 +1087,74 @@ public class UploadService extends Service {
                 conn.disconnect();
             }
         }
+    }
+
+    private boolean waitForFileReadyAfterPutError(
+            String base,
+            String token,
+            String target,
+            long expectedSize,
+            boolean overwrite,
+            int index,
+            int total,
+            String displayName
+    ) throws Exception {
+        updateProgress(
+                index,
+                total,
+                displayName,
+                99,
+                "上传数据已发送，正在确认服务器是否已完成",
+                "uploading"
+        );
+
+        // A proxy can lose the final response after OpenList has already
+        // committed the file. Give the origin time to finish and verify by
+        // exact target path/size before reporting failure.
+        for (int poll = 0; poll < 30; poll++) {
+            try {
+                if (fileReady(
+                        base,
+                        token,
+                        target,
+                        expectedSize,
+                        overwrite
+                )) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+                // Continue probing. The next probe may succeed after a
+                // transient Tunnel/origin 5xx.
+            }
+
+            Thread.sleep(2000L);
+        }
+
+        return false;
+    }
+
+    private boolean isTransientRemoteException(IOException e) {
+        Throwable current = e;
+
+        for (int i = 0; current != null && i < 3; i++, current = current.getCause()) {
+            String message = current.getMessage();
+            if (message == null) continue;
+
+            if (message.contains("502") ||
+                    message.contains("503") ||
+                    message.contains("504") ||
+                    message.contains("520") ||
+                    message.contains("521") ||
+                    message.contains("522") ||
+                    message.contains("523") ||
+                    message.contains("524") ||
+                    message.contains("525") ||
+                    message.contains("526")) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private TaskResult getUploadTaskInfo(
