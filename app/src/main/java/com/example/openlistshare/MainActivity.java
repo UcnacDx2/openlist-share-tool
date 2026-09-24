@@ -446,11 +446,21 @@ public class MainActivity extends Activity {
                 String time = item.optString("time", "");
                 String name = item.optString("name", "");
                 String url = item.optString("url", "");
+                String status = item.optString("status", "success");
+                String error = item.optString("error", "");
 
                 if (sb.length() > 0) sb.append("\n\n");
                 if (!time.isEmpty()) sb.append(time).append("\n");
                 if (!name.isEmpty()) sb.append(name).append("\n");
-                sb.append(url);
+
+                if ("failed".equals(status)) {
+                    sb.append("失败");
+                    if (!error.isEmpty()) {
+                        sb.append("\n").append(error);
+                    }
+                } else {
+                    sb.append(url);
+                }
             }
 
             historyText.setText(sb.length() == 0 ? "暂无上传历史" : sb.toString());

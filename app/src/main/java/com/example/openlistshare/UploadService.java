@@ -110,17 +110,23 @@ public class UploadService extends Service {
             Uri uri = uris.get(index);
             String originalName = sanitizeFileName(displayName(uri));
             long size = sizeOf(uri);
+            String finalName = originalName;
+            String stage = "准备";
 
             try {
                 String target = joinPath(dir, originalName);
 
+                stage = "检查重名";
                 if (!overwrite && exists(base, token, target)) {
+                    stage = "生成避免重名的新文件名";
                     target = timestampTarget(base, token, dir, originalName);
                 }
 
-                String finalName = baseName(target);
+                finalName = baseName(target);
+                stage = "准备上传";
                 updateProgress(index, total, finalName, 0);
 
+                stage = "上传文件";
                 uploadOne(
                         base,
                         token,
@@ -133,13 +139,20 @@ public class UploadService extends Service {
                         finalName
                 );
 
+                stage = "生成 OpenList 302 直链";
                 String directUrl = getOpenList302Url(base, token, target);
                 saveLastLink(directUrl, finalName);
-                saveHistory(directUrl, finalName);
+                saveHistory(directUrl, finalName, "success", "");
 
                 postComplete(index + 1, total, finalName, directUrl);
             } catch (Exception e) {
-                finishWithError("上传 " + originalName + " 失败：" + friendlyError(e));
+                String reason = friendlyError(e);
+                saveHistory("", finalName, "failed", stage + "： " + reason);
+                finishWithError(
+                        "文件：" + originalName +
+                                "\n阶段：" + stage +
+                                "\n原因：" + reason
+                );
                 return;
             }
         }
@@ -410,7 +423,7 @@ public class UploadService extends Service {
                 .apply();
     }
 
-    private void saveHistory(String url, String name) {
+    private void saveHistory(String url, String name, String status, String error) {
         SharedPreferences prefs =
                 getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
 
@@ -437,6 +450,10 @@ public class UploadService extends Service {
             );
             item.put("name", name);
             item.put("url", url);
+            item.put("status", status);
+            if (error != null && !error.isEmpty()) {
+                item.put("error", error);
+            }
         } catch (Exception ignored) {
         }
 
@@ -851,11 +868,26 @@ public class UploadService extends Service {
     }
 
     private String friendlyError(Exception e) {
-        String msg = e.getMessage();
+        Throwable current = e;
+        StringBuilder sb = new StringBuilder();
 
-        return msg == null || msg.isEmpty()
+        for (int i = 0; current != null && i < 3; i++, current = current.getCause()) {
+            String msg = current.getMessage();
+
+            if (msg == null || msg.isEmpty()) {
+                msg = current.getClass().getSimpleName();
+            }
+
+            if (sb.length() > 0) {
+                sb.append(" <- ");
+            }
+
+            sb.append(msg);
+        }
+
+        return sb.length() == 0
                 ? e.getClass().getSimpleName()
-                : msg;
+                : sb.toString();
     }
 
     private static final class HttpResult {
