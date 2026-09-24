@@ -132,6 +132,9 @@ public final class MultipartUploader {
                     (int) ((size + chunkSize - 1) / chunkSize);
         }
 
+        final long effectiveChunkSize = chunkSize;
+        final int effectiveTotalChunks = totalChunks;
+
         Set<Integer> received = parseReceived(session);
         List<Integer> missing = new ArrayList<>();
 
@@ -196,6 +199,8 @@ public final class MultipartUploader {
                     Executors.newFixedThreadPool(workerCount);
 
             List<Future<?>> futures = new ArrayList<>();
+            AtomicReference<Exception> fatal =
+                    new AtomicReference<>(null);
 
             try {
                 for (int worker = 0;
@@ -214,24 +219,32 @@ public final class MultipartUploader {
                                     int chunkIndex =
                                             missing.get(pos);
 
-                                    sendChunkWithRetry(
-                                            base,
-                                            token,
-                                            uploadId,
-                                            uri,
-                                            source,
-                                            chunkIndex,
-                                            chunkSize,
-                                            size,
-                                            totalChunks,
-                                            ackedBytes,
-                                            inFlightBytes,
-                                            peakBytes,
-                                            attemptLoaded,
-                                            lastReportAt,
-                                            listener,
-                                            inflight
-                                    );
+                                    try {
+                                        sendChunkWithRetry(
+                                                base,
+                                                token,
+                                                uploadId,
+                                                uri,
+                                                source,
+                                                chunkIndex,
+                                                effectiveChunkSize,
+                                                size,
+                                                effectiveTotalChunks,
+                                                ackedBytes,
+                                                inFlightBytes,
+                                                peakBytes,
+                                                attemptLoaded,
+                                                lastReportAt,
+                                                listener,
+                                                inflight
+                                        );
+                                    } catch (Exception e) {
+                                        fatal.compareAndSet(
+                                                null,
+                                                e
+                                        );
+                                        return;
+                                    }
                                 }
                             })
                     );
@@ -239,6 +252,13 @@ public final class MultipartUploader {
 
                 for (Future<?> future : futures) {
                     future.get();
+                }
+
+                Exception uploadError =
+                        fatal.get();
+
+                if (uploadError != null) {
+                    throw uploadError;
                 }
             } finally {
                 workers.shutdownNow();
