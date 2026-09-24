@@ -992,17 +992,22 @@ public class UploadService extends Service {
                                 );
 
                         if (taskProgress >= 0.0) {
+                            int shownProgress =
+                                    taskProgress >= 100.0
+                                            ? 99
+                                            : Math.max(
+                                                    99,
+                                                    Math.min(
+                                                            99,
+                                                            (int) taskProgress
+                                                    )
+                                            );
+
                             updateProgress(
                                     index,
                                     total,
                                     displayName,
-                                    Math.max(
-                                            99,
-                                            Math.min(
-                                                    99,
-                                                    (int) taskProgress
-                                            )
-                                    ),
+                                    shownProgress,
                                     "服务器后台写入 · " +
                                             String.format(
                                                     Locale.US,
@@ -1012,6 +1017,20 @@ public class UploadService extends Service {
                                             "%",
                                     "uploading"
                             );
+
+                            // Some OpenList/storage combinations can expose
+                            // 100.0% before the task state flips to succeeded.
+                            // The file itself is authoritative at this point.
+                            if (taskProgress >= 100.0 &&
+                                    fileReady(
+                                            base,
+                                            token,
+                                            target,
+                                            size,
+                                            overwrite
+                                    )) {
+                                return;
+                            }
                         }
 
                         String state =
