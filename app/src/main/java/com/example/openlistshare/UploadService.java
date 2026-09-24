@@ -5,9 +5,6 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.ClipData;
-import android.content.ClipboardManager;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.drawable.Icon;
@@ -35,7 +32,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public class UploadService extends Service {
     private static final String CHANNEL_ID = "openlist_uploads";
@@ -43,7 +39,6 @@ public class UploadService extends Service {
     private static final int PAGE_SIZE = 1000;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final AtomicInteger queuedJobs = new AtomicInteger();
 
     @Override
     public void onCreate() {
@@ -64,19 +59,17 @@ public class UploadService extends Service {
 
         startForeground(
                 NOTIFICATION_ID,
-                buildNotification("OpenList 快传", "准备上传 " + uris.size() + " 个文件", 0, true, "")
+                buildNotification(
+                        "OpenList 快传",
+                        "准备上传 " + uris.size() + " 个文件",
+                        0,
+                        true,
+                        ""
+                )
         );
 
-        queuedJobs.incrementAndGet();
         executor.execute(() -> {
-            try {
-                uploadAll(uris);
-            } finally {
-                if (queuedJobs.decrementAndGet() == 0) {
-                    stopForeground(false);
-                    stopSelf();
-                }
-            }
+            uploadAll(uris);
         });
 
         return START_NOT_STICKY;
@@ -123,10 +116,21 @@ public class UploadService extends Service {
                 String finalName = baseName(target);
                 updateProgress(index, total, finalName, 0);
 
-                uploadOne(base, token, uri, target, overwrite, size, index, total, finalName);
+                uploadOne(
+                        base,
+                        token,
+                        uri,
+                        target,
+                        overwrite,
+                        size,
+                        index,
+                        total,
+                        finalName
+                );
 
                 String directUrl = getOpenList302Url(base, token, target);
                 saveLastLink(directUrl, finalName);
+                saveHistory(directUrl, finalName);
 
                 postComplete(index + 1, total, finalName, directUrl);
             } catch (Exception e) {
@@ -142,20 +146,29 @@ public class UploadService extends Service {
             String dir,
             String originalName
     ) throws Exception {
-        String stamp = new SimpleDateFormat("yyyy-MM-dd HH-mm-ss", Locale.getDefault())
-                .format(new Date());
+        String stamp = new SimpleDateFormat(
+                "yyyy-MM-dd HH-mm-ss",
+                Locale.getDefault()
+        ).format(new Date());
 
         String candidate = appendTimestamp(originalName, stamp);
         int serial = 2;
 
         while (exists(base, token, joinPath(dir, candidate))) {
-            candidate = appendTimestamp(originalName, stamp + " #" + serial++);
+            candidate = appendTimestamp(
+                    originalName,
+                    stamp + " #" + serial++
+            );
         }
 
         return joinPath(dir, candidate);
     }
 
-    private boolean exists(String base, String token, String target) throws Exception {
+    private boolean exists(
+            String base,
+            String token,
+            String target
+    ) throws Exception {
         String dir = parentPath(target);
         String name = baseName(target);
 
@@ -178,15 +191,22 @@ public class UploadService extends Service {
 
             if (result.httpCode < 200 || result.httpCode >= 300) {
                 throw new IOException(
-                        "检查重名失败 HTTP " + result.httpCode + "：" + safeMessage(result.body)
+                        "检查重名失败 HTTP " +
+                                result.httpCode +
+                                "：" +
+                                safeMessage(result.body)
                 );
             }
 
             JSONObject json = new JSONObject(result.body);
             int code = json.optInt("code", result.httpCode);
+
             if (code != 200) {
                 throw new IOException(
-                        "检查重名失败 " + code + "：" + json.optString("message", result.body)
+                        "检查重名失败 " +
+                                code +
+                                "：" +
+                                json.optString("message", result.body)
                 );
             }
 
@@ -202,13 +222,17 @@ public class UploadService extends Service {
             if (content != null) {
                 for (int i = 0; i < content.length(); i++) {
                     JSONObject item = content.optJSONObject(i);
-                    if (item != null && name.equals(item.optString("name", ""))) {
+
+                    if (item != null &&
+                            name.equals(item.optString("name", ""))) {
                         return true;
                     }
                 }
             }
 
-            if (content == null || content.length() == 0 || page * PAGE_SIZE >= reportedTotal) {
+            if (content == null ||
+                    content.length() == 0 ||
+                    page * PAGE_SIZE >= reportedTotal) {
                 return false;
             }
 
@@ -234,10 +258,12 @@ public class UploadService extends Service {
         try {
             URL url = new URL(base + "/api/fs/put");
             conn = (HttpURLConnection) url.openConnection();
+
             conn.setRequestMethod("PUT");
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(0);
             conn.setDoOutput(true);
+
             conn.setRequestProperty("Authorization", token);
             conn.setRequestProperty("File-Path", Uri.encode(target, "/"));
             conn.setRequestProperty("As-Task", "false");
@@ -267,10 +293,22 @@ public class UploadService extends Service {
                         sent += read;
 
                         long now = System.currentTimeMillis();
-                        if (size > 0 && (now - lastUpdate >= 300 || sent == size)) {
-                            int progress = (int) Math.min(100L, sent * 100L / size);
+
+                        if (size > 0 &&
+                                (now - lastUpdate >= 300 || sent == size)) {
+                            int progress = (int) Math.min(
+                                    100L,
+                                    sent * 100L / size
+                            );
+
                             lastUpdate = now;
-                            updateProgress(index, total, displayName, progress);
+
+                            updateProgress(
+                                    index,
+                                    total,
+                                    displayName,
+                                    progress
+                            );
                         }
                     }
                 }
@@ -281,16 +319,24 @@ public class UploadService extends Service {
 
             if (code < 200 || code >= 300) {
                 throw new IOException(
-                        "OpenList 上传 HTTP " + code + "：" + safeMessage(body)
+                        "OpenList 上传 HTTP " +
+                                code +
+                                "：" +
+                                safeMessage(body)
                 );
             }
 
-            JSONObject json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+            JSONObject json = body.isEmpty()
+                    ? new JSONObject()
+                    : new JSONObject(body);
+
             int apiCode = json.optInt("code", code);
 
             if (apiCode != 200) {
                 throw new IOException(
-                        "OpenList 上传失败 " + apiCode + "：" +
+                        "OpenList 上传失败 " +
+                                apiCode +
+                                "：" +
                                 json.optString("message", body)
                 );
             }
@@ -317,7 +363,9 @@ public class UploadService extends Service {
 
         if (result.httpCode < 200 || result.httpCode >= 300) {
             throw new IOException(
-                    "获取 OpenList 直链失败 HTTP " + result.httpCode + "：" +
+                    "获取 OpenList 直链失败 HTTP " +
+                            result.httpCode +
+                            "：" +
                             safeMessage(result.body)
             );
         }
@@ -327,13 +375,17 @@ public class UploadService extends Service {
 
         if (code != 200) {
             throw new IOException(
-                    "获取 OpenList 直链失败 " + code + "：" +
+                    "获取 OpenList 直链失败 " +
+                            code +
+                            "：" +
                             json.optString("message", result.body)
             );
         }
 
         JSONObject data = json.optJSONObject("data");
-        if (data == null) throw new IOException("OpenList 未返回文件信息");
+        if (data == null) {
+            throw new IOException("OpenList 未返回文件信息");
+        }
 
         String sign = data.optString("sign", "");
         String link = base + "/d" + Uri.encode(target, "/");
@@ -346,24 +398,82 @@ public class UploadService extends Service {
     }
 
     private void saveLastLink(String url, String name) {
-        getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE).edit()
+        getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE)
+                .edit()
                 .putString(MainActivity.KEY_LAST_URL, url)
                 .putString(MainActivity.KEY_LAST_NAME, name)
                 .apply();
     }
 
-    private void postComplete(int completed, int total, String name, String url) {
-        int overall = total == 0 ? 100 : (completed * 100 / total);
+    private void saveHistory(String url, String name) {
+        SharedPreferences prefs =
+                getSharedPreferences(MainActivity.PREFS, MODE_PRIVATE);
+
+        JSONArray oldHistory;
+
+        try {
+            String raw = prefs.getString(MainActivity.KEY_HISTORY, "");
+            oldHistory = raw.isEmpty() ? new JSONArray() : new JSONArray(raw);
+        } catch (Exception e) {
+            oldHistory = new JSONArray();
+        }
+
+        JSONArray newHistory = new JSONArray();
+
+        JSONObject item = new JSONObject();
+
+        try {
+            item.put(
+                    "time",
+                    new SimpleDateFormat(
+                            "yyyy-MM-dd HH:mm:ss",
+                            Locale.getDefault()
+                    ).format(new Date())
+            );
+            item.put("name", name);
+            item.put("url", url);
+        } catch (Exception ignored) {
+        }
+
+        newHistory.put(item);
+
+        for (int i = 0; i < oldHistory.length() && i < MainActivityHistoryLimit(); i++) {
+            JSONObject old = oldHistory.optJSONObject(i);
+            if (old != null) newHistory.put(old);
+        }
+
+        prefs.edit()
+                .putString(MainActivity.KEY_HISTORY, newHistory.toString())
+                .apply();
+    }
+
+    private int MainActivityHistoryLimit() {
+        return 49;
+    }
+
+    private void postComplete(
+            int completed,
+            int total,
+            String name,
+            String url
+    ) {
+        int overall = total == 0
+                ? 100
+                : (completed * 100 / total);
 
         String text = completed == total
                 ? name + "\n" + url
                 : completed + "/" + total + " · " + name + "\n" + url;
 
-        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        NotificationManager nm =
+                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
         nm.notify(
                 NOTIFICATION_ID,
                 buildNotification(
-                        completed == total ? "OpenList 快传完成" : "OpenList 快传",
+                        completed == total
+                                ? "OpenList 快传完成"
+                                : "OpenList 快传",
                         text,
                         overall,
                         completed != total,
@@ -379,6 +489,7 @@ public class UploadService extends Service {
             int fileProgress
     ) {
         int completed = index;
+
         int overall = total <= 0
                 ? fileProgress
                 : (int) Math.min(
@@ -386,12 +497,16 @@ public class UploadService extends Service {
                         ((long) completed * 100L + fileProgress) / total
                 );
 
-        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        NotificationManager nm =
+                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
         nm.notify(
                 NOTIFICATION_ID,
                 buildNotification(
                         "OpenList 快传",
-                        (index + 1) + "/" + total + " · " + name + " · " + fileProgress + "%",
+                        (index + 1) + "/" + total +
+                                " · " + name +
+                                " · " + fileProgress + "%",
                         overall,
                         true,
                         getLastUrl()
@@ -419,30 +534,48 @@ public class UploadService extends Service {
                         .setSmallIcon(android.R.drawable.stat_sys_upload)
                         .setContentTitle(title)
                         .setContentText(text)
-                        .setStyle(new Notification.BigTextStyle().bigText(text))
+                        .setStyle(
+                                new Notification.BigTextStyle().bigText(text)
+                        )
                         .setContentIntent(openPending)
                         .setOnlyAlertOnce(true)
                         .setOngoing(ongoing)
                         .setAutoCancel(!ongoing);
 
         if (ongoing) {
-            builder.setProgress(100, Math.max(0, Math.min(100, progress)), false);
+            builder.setProgress(
+                    100,
+                    Math.max(0, Math.min(100, progress)),
+                    false
+            );
         }
 
         if (link != null && !link.isEmpty()) {
-            Intent copyIntent = new Intent(this, NotificationActionReceiver.class);
-            copyIntent.setAction(NotificationActionReceiver.ACTION_COPY_LINK);
+            Intent copyIntent =
+                    new Intent(this, NotificationActionReceiver.class);
 
-            PendingIntent copyPending = PendingIntent.getBroadcast(
-                    this,
-                    2,
-                    copyIntent,
-                    pendingFlags()
+            copyIntent.setAction(
+                    NotificationActionReceiver.ACTION_COPY_LINK
             );
+            copyIntent.putExtra(
+                    NotificationActionReceiver.EXTRA_LINK,
+                    link
+            );
+
+            PendingIntent copyPending =
+                    PendingIntent.getBroadcast(
+                            this,
+                            2,
+                            copyIntent,
+                            pendingFlags()
+                    );
 
             builder.addAction(
                     new Notification.Action.Builder(
-                            Icon.createWithResource(this, android.R.drawable.ic_menu_save),
+                            Icon.createWithResource(
+                                    this,
+                                    android.R.drawable.ic_menu_save
+                            ),
                             "复制直链",
                             copyPending
                     ).build()
@@ -453,24 +586,31 @@ public class UploadService extends Service {
     }
 
     private int pendingFlags() {
-        return PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE;
+        return PendingIntent.FLAG_UPDATE_CURRENT |
+                PendingIntent.FLAG_IMMUTABLE;
     }
 
     private void createNotificationChannel() {
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID,
-                "OpenList 上传",
-                NotificationManager.IMPORTANCE_LOW
-        );
+        NotificationChannel channel =
+                new NotificationChannel(
+                        CHANNEL_ID,
+                        "OpenList 上传",
+                        NotificationManager.IMPORTANCE_LOW
+                );
+
         channel.setDescription("显示 OpenList 文件上传进度和直链");
         channel.setShowBadge(false);
 
-        NotificationManager nm = getSystemService(NotificationManager.class);
+        NotificationManager nm =
+                getSystemService(NotificationManager.class);
+
         nm.createNotificationChannel(channel);
     }
 
     private void finishWithError(String message) {
-        NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        NotificationManager nm =
+                (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+
         nm.notify(
                 NOTIFICATION_ID,
                 buildNotification(
@@ -481,6 +621,16 @@ public class UploadService extends Service {
                         getLastUrl()
                 )
         );
+
+        detachForeground();
+    }
+
+    private void detachForeground() {
+        if (Build.VERSION.SDK_INT >= 24) {
+            stopForeground(Service.STOP_FOREGROUND_DETACH);
+        } else {
+            stopForeground(false);
+        }
     }
 
     private String getLastUrl() {
@@ -499,15 +649,22 @@ public class UploadService extends Service {
         try {
             URL url = new URL(urlText);
             conn = (HttpURLConnection) url.openConnection();
+
             conn.setRequestMethod(method);
             conn.setConnectTimeout(15000);
             conn.setReadTimeout(20000);
             conn.setDoInput(true);
             conn.setDoOutput(true);
-            conn.setRequestProperty("Authorization", token);
-            conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
 
-            byte[] payload = jsonBody.getBytes(StandardCharsets.UTF_8);
+            conn.setRequestProperty("Authorization", token);
+            conn.setRequestProperty(
+                    "Content-Type",
+                    "application/json; charset=UTF-8"
+            );
+
+            byte[] payload =
+                    jsonBody.getBytes(StandardCharsets.UTF_8);
+
             conn.setFixedLengthStreamingMode(payload.length);
 
             try (OutputStream out = conn.getOutputStream()) {
@@ -532,8 +689,12 @@ public class UploadService extends Service {
 
         if (stream == null) return "";
 
-        try (BufferedReader reader = new BufferedReader(
-                new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+        try (BufferedReader reader =
+                     new BufferedReader(
+                             new InputStreamReader(
+                                     stream,
+                                     StandardCharsets.UTF_8
+                             ))) {
             StringBuilder sb = new StringBuilder();
             String line;
 
@@ -558,7 +719,9 @@ public class UploadService extends Service {
             );
 
             if (cursor != null && cursor.moveToFirst()) {
-                return cursor.isNull(0) ? -1 : cursor.getLong(0);
+                return cursor.isNull(0)
+                        ? -1
+                        : cursor.getLong(0);
             }
         } catch (Exception ignored) {
         } finally {
@@ -582,6 +745,7 @@ public class UploadService extends Service {
 
             if (cursor != null && cursor.moveToFirst()) {
                 String name = cursor.getString(0);
+
                 if (name != null && !name.trim().isEmpty()) {
                     return name;
                 }
@@ -592,15 +756,21 @@ public class UploadService extends Service {
         }
 
         String path = uri.getPath();
-        if (path == null || path.isEmpty()) return "upload.bin";
+
+        if (path == null || path.isEmpty()) {
+            return "upload.bin";
+        }
 
         int i = path.lastIndexOf('/');
+
         return i >= 0 ? path.substring(i + 1) : path;
     }
 
     private String sanitizeFileName(String value) {
         String s = value == null ? "" : value.trim();
+
         if (s.isEmpty()) s = "upload.bin";
+
         return s.replace("/", "_").replace("\\", "_");
     }
 
@@ -608,9 +778,9 @@ public class UploadService extends Service {
         int dot = name.lastIndexOf('.');
 
         if (dot > 0) {
-            return name.substring(0, dot)
-                    + " (" + timestamp + ")"
-                    + name.substring(dot);
+            return name.substring(0, dot) +
+                    " (" + timestamp + ")" +
+                    name.substring(dot);
         }
 
         return name + " (" + timestamp + ")";
@@ -620,6 +790,7 @@ public class UploadService extends Service {
         int index = path.lastIndexOf('/');
 
         if (index <= 0) return "/";
+
         return path.substring(0, index);
     }
 
@@ -627,17 +798,21 @@ public class UploadService extends Service {
         int index = path.lastIndexOf('/');
 
         if (index < 0) return path;
+
         return path.substring(index + 1);
     }
 
     private String joinPath(String dir, String name) {
-        return "/".equals(dir) ? "/" + name : dir + "/" + name;
+        return "/".equals(dir)
+                ? "/" + name
+                : dir + "/" + name;
     }
 
     private String normalizeDir(String value) {
         String s = value == null ? "" : value.trim();
 
         if (s.isEmpty()) return "/";
+
         if (!s.startsWith("/")) s = "/" + s;
 
         while (s.endsWith("/") && s.length() > 1) {
@@ -661,9 +836,12 @@ public class UploadService extends Service {
         if (body == null || body.isEmpty()) return "无返回内容";
 
         try {
-            return new JSONObject(body).optString("message", body);
+            return new JSONObject(body)
+                    .optString("message", body);
         } catch (Exception ignored) {
-            return body.length() > 300 ? body.substring(0, 300) : body;
+            return body.length() > 300
+                    ? body.substring(0, 300)
+                    : body;
         }
     }
 

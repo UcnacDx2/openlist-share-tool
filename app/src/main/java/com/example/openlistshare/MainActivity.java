@@ -20,6 +20,7 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.BufferedReader;
@@ -43,9 +44,11 @@ public class MainActivity extends Activity {
     public static final String KEY_OVERWRITE = "overwrite";
     public static final String KEY_LAST_URL = "last_url";
     public static final String KEY_LAST_NAME = "last_name";
+    public static final String KEY_HISTORY = "upload_history";
     public static final String EXTRA_URIS = "uris";
 
     private static final int REQUEST_POST_NOTIFICATIONS = 1001;
+    private static final int HISTORY_LIMIT = 50;
 
     private EditText baseUrlInput;
     private EditText tokenInput;
@@ -54,6 +57,7 @@ public class MainActivity extends Activity {
     private TextView incomingText;
     private TextView statusText;
     private TextView lastLinkText;
+    private TextView historyText;
     private Button uploadButton;
     private Button testButton;
     private Button copyButton;
@@ -75,6 +79,7 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         refreshLastLink();
+        refreshHistory();
     }
 
     @Override
@@ -169,6 +174,14 @@ public class MainActivity extends Activity {
         shareButton.setEnabled(false);
         root.addView(shareButton, matchWrap());
 
+        root.addView(label("上传历史"));
+        historyText = new TextView(this);
+        historyText.setText("暂无上传历史");
+        historyText.setTextIsSelectable(true);
+        historyText.setTextSize(13);
+        historyText.setPadding(0, 0, 0, dp(8));
+        root.addView(historyText, matchWrap());
+
         testButton.setOnClickListener(v -> testConnection());
         uploadButton.setOnClickListener(v -> startUploadService(false));
         copyButton.setOnClickListener(v -> copyLastUrl());
@@ -217,6 +230,7 @@ public class MainActivity extends Activity {
         dirInput.setText(p.getString(KEY_DIR, "/uploads"));
         overwriteBox.setChecked(p.getBoolean(KEY_OVERWRITE, false));
         refreshLastLink();
+        refreshHistory();
     }
 
     private void saveConfig() {
@@ -233,6 +247,8 @@ public class MainActivity extends Activity {
         List<Uri> uris = extractUris(intent);
         if (uris.isEmpty()) return;
 
+        persistIncomingUriPermissions(intent, uris);
+
         pendingUris.clear();
         pendingUris.addAll(uris);
 
@@ -247,6 +263,24 @@ public class MainActivity extends Activity {
             startUploadService(true);
         } else {
             statusText.setText("已接收文件，请先填写 OpenList 地址和 Token");
+        }
+    }
+
+    private void persistIncomingUriPermissions(Intent intent, List<Uri> uris) {
+        int takeFlags = intent.getFlags() &
+                (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+
+        if ((takeFlags & Intent.FLAG_GRANT_READ_URI_PERMISSION) == 0) {
+            return;
+        }
+
+        for (Uri uri : uris) {
+            try {
+                getContentResolver().takePersistableUriPermission(uri, takeFlags);
+            } catch (Exception ignored) {
+                // Many share providers do not offer persistable permissions.
+                // The foreground service still tries the granted URI directly.
+            }
         }
     }
 
@@ -316,15 +350,24 @@ public class MainActivity extends Activity {
         Intent service = new Intent(this, UploadService.class);
         service.putParcelableArrayListExtra(EXTRA_URIS, new ArrayList<>(pendingUris));
 
-        if (Build.VERSION.SDK_INT >= 26) {
-            startForegroundService(service);
-        } else {
-            startService(service);
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(service);
+            } else {
+                startService(service);
+            }
+        } catch (RuntimeException e) {
+            statusText.setText("无法启动后台上传：" + friendlyError(e));
+            return;
         }
 
         statusText.setText("后台上传已启动，请在通知栏查看进度");
+
         if (fromShare) {
-            finish();
+            // Do not destroy the activity here: the sender may have granted a
+            // transient content:// read permission tied to this share flow.
+            // Move the task out of the foreground instead.
+            moveTaskToBack(true);
         }
     }
 
@@ -385,8 +428,35 @@ public class MainActivity extends Activity {
         shareButton.setEnabled(true);
     }
 
-    private String getLastUrl() {
-        return getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LAST_URL, "");
+    private void refreshHistory() {
+        String raw = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_HISTORY, "");
+        if (raw.isEmpty()) {
+            historyText.setText("暂无上传历史");
+            return;
+        }
+
+        try {
+            JSONArray history = new JSONArray(raw);
+            StringBuilder sb = new StringBuilder();
+
+            for (int i = 0; i < history.length(); i++) {
+                JSONObject item = history.optJSONObject(i);
+                if (item == null) continue;
+
+                String time = item.optString("time", "");
+                String name = item.optString("name", "");
+                String url = item.optString("url", "");
+
+                if (sb.length() > 0) sb.append("\n\n");
+                if (!time.isEmpty()) sb.append(time).append("\n");
+                if (!name.isEmpty()) sb.append(name).append("\n");
+                sb.append(url);
+            }
+
+            historyText.setText(sb.length() == 0 ? "暂无上传历史" : sb.toString());
+        } catch (Exception e) {
+            historyText.setText("上传历史读取失败");
+        }
     }
 
     private void copyLastUrl() {
@@ -413,6 +483,10 @@ public class MainActivity extends Activity {
         startActivity(Intent.createChooser(intent, "分享 OpenList 直链"));
     }
 
+    private String getLastUrl() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_LAST_URL, "");
+    }
+
     private String normalizedBaseUrl() {
         String s = baseUrlInput.getText().toString().trim();
         while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
@@ -428,52 +502,54 @@ public class MainActivity extends Activity {
     }
 
     private long sizeOf(Uri uri) {
-        CursorHolder holder = new CursorHolder();
+        android.database.Cursor cursor = null;
         try {
-            holder.cursor = getContentResolver().query(
+            cursor = getContentResolver().query(
                     uri,
                     new String[]{OpenableColumns.SIZE},
                     null,
                     null,
                     null
             );
-            if (holder.cursor != null && holder.cursor.moveToFirst()) {
-                return holder.cursor.isNull(0) ? -1 : holder.cursor.getLong(0);
+            if (cursor != null && cursor.moveToFirst()) {
+                return cursor.isNull(0) ? -1 : cursor.getLong(0);
             }
         } catch (Exception ignored) {
         } finally {
-            holder.close();
+            if (cursor != null) cursor.close();
         }
         return -1;
     }
 
     private String displayName(Uri uri) {
-        CursorHolder holder = new CursorHolder();
+        android.database.Cursor cursor = null;
         try {
-            holder.cursor = getContentResolver().query(
+            cursor = getContentResolver().query(
                     uri,
                     new String[]{OpenableColumns.DISPLAY_NAME},
                     null,
                     null,
                     null
             );
-            if (holder.cursor != null && holder.cursor.moveToFirst()) {
-                String name = holder.cursor.getString(0);
+            if (cursor != null && cursor.moveToFirst()) {
+                String name = cursor.getString(0);
                 if (name != null && !name.trim().isEmpty()) return name;
             }
         } catch (Exception ignored) {
         } finally {
-            holder.close();
+            if (cursor != null) cursor.close();
         }
 
         String path = uri.getPath();
         if (path == null || path.isEmpty()) return "upload.bin";
+
         int i = path.lastIndexOf('/');
         return i >= 0 ? path.substring(i + 1) : path;
     }
 
     private HttpResult requestJson(String method, String urlText, String token, String jsonBody) throws Exception {
         HttpURLConnection conn = null;
+
         try {
             URL url = new URL(urlText);
             conn = (HttpURLConnection) url.openConnection();
@@ -501,6 +577,7 @@ public class MainActivity extends Activity {
 
     private String readBody(HttpURLConnection conn) throws IOException {
         InputStream stream;
+
         try {
             stream = conn.getInputStream();
         } catch (IOException e) {
@@ -512,8 +589,12 @@ public class MainActivity extends Activity {
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(stream, StandardCharsets.UTF_8))) {
             StringBuilder sb = new StringBuilder();
+
             String line;
-            while ((line = reader.readLine()) != null) sb.append(line);
+            while ((line = reader.readLine()) != null) {
+                sb.append(line);
+            }
+
             return sb.toString();
         }
     }
@@ -530,14 +611,6 @@ public class MainActivity extends Activity {
         HttpResult(int httpCode, String body) {
             this.httpCode = httpCode;
             this.body = body;
-        }
-    }
-
-    private static final class CursorHolder {
-        android.database.Cursor cursor;
-
-        void close() {
-            if (cursor != null) cursor.close();
         }
     }
 }
