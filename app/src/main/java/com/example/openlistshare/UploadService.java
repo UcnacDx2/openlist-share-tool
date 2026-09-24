@@ -55,8 +55,8 @@ public class UploadService extends Service {
     private static final String CHANNEL_ID = "openlist_uploads";
     private static final int NOTIFICATION_ID = 20260924;
     private static final int PAGE_SIZE = 1000;
-    private static final int DEFAULT_LARGE_FILE_THRESHOLD_MB = 512;
-    private static final int DEFAULT_CHUNK_SIZE_MB = 2;
+    private static final int DEFAULT_LARGE_FILE_THRESHOLD_MB = 32;
+    private static final int DEFAULT_CHUNK_SIZE_MB = 10;
     private static final int DEFAULT_CHUNK_PARALLEL = 3;
     private static final int DEFAULT_FILE_PARALLEL = 2;
     private static final int MAX_CHUNK_SIZE_MB = 64;
