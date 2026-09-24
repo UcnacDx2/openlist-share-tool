@@ -629,7 +629,7 @@ public class UploadService extends Service {
             InputStream in = new BufferedInputStream(raw, 128 * 1024);
 
             while (submitted < totalChunks) {
-                while (submitted - completed >= MAX_PARALLEL_CHUNKS) {
+                while (submitted - completed >= chunkParallel) {
                     ChunkUploadResult result = awaitChunk(completion);
                     completed++;
 
