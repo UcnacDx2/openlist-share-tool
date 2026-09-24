@@ -171,8 +171,8 @@ public class MainActivity extends Activity {
         fileParallelInput = input("2");
         root.addView(fileParallelInput, matchWrap());
 
-        root.addView(label("大文件分片阈值（MiB，1-1024）"));
-        largeFileThresholdInput = input("32");
+        root.addView(label("大文件分片阈值（MB，1-1024）"));
+        largeFileThresholdInput = input("100");
         root.addView(largeFileThresholdInput, matchWrap());
 
         TextView parallelHint = new TextView(this);
@@ -286,7 +286,7 @@ public class MainActivity extends Activity {
         dirInput.setText(p.getString(KEY_DIR, "/uploads"));
         int storedChunkSize = p.getInt(KEY_CHUNK_SIZE_MB, 10);
         int storedChunkParallel = p.getInt(KEY_CHUNK_PARALLEL, 3);
-        int storedThreshold = p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 32);
+        int storedThreshold = p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 100);
 
         // Migrate the previous built-in defaults. OpenList multipart has a
         // bounded server-side ring window, so medium files are smoother with
@@ -295,14 +295,14 @@ public class MainActivity extends Activity {
             storedChunkSize = 2;
             storedChunkParallel = 3;
         }
-        if (storedThreshold == 8) {
-            storedThreshold = 512;
+        if (storedThreshold == 8 || storedThreshold == 32 || storedThreshold == 160 || storedThreshold == 512) {
+            storedThreshold = 100;
         }
 
         chunkSizeInput.setText(Integer.toString(storedChunkSize));
         chunkParallelInput.setText(Integer.toString(storedChunkParallel));
         fileParallelInput.setText(Integer.toString(p.getInt(KEY_FILE_PARALLEL, 2)));
-        largeFileThresholdInput.setText(Integer.toString(p.getInt(KEY_LARGE_FILE_THRESHOLD_MB, 512)));
+        largeFileThresholdInput.setText(Integer.toString(storedThreshold));
         overwriteBox.setChecked(p.getBoolean(KEY_OVERWRITE, false));
         refreshLastLink();
         refreshHistory();
@@ -312,7 +312,7 @@ public class MainActivity extends Activity {
         int chunkSizeMb = parseIntInRange(chunkSizeInput, 2, 1, 64);
         int chunkParallel = parseIntInRange(chunkParallelInput, 3, 1, 8);
         int fileParallel = parseIntInRange(fileParallelInput, 2, 1, 4);
-        int thresholdMb = parseIntInRange(largeFileThresholdInput, 32, 1, 1024);
+        int thresholdMb = parseIntInRange(largeFileThresholdInput, 100, 1, 1024);
 
         if (chunkSizeMb < 1 || chunkParallel < 1 ||
                 fileParallel < 1 || thresholdMb < 1) {
