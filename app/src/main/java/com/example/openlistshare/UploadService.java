@@ -901,28 +901,117 @@ public class UploadService extends Service {
                 );
             }
 
-            // With As-Task=true OpenList has only accepted/cached the request
-            // at this point. Wait until the actual object is visible before
-            // generating the final direct link.
-            updateProgress(
-                    index,
-                    total,
-                    displayName,
-                    Math.max(
-                            99,
-                            size > 0
-                                    ? (int) Math.min(
-                                            99L,
-                                            size * 100L / size
-                                    )
-                                    : 99
-                    ),
-                    "服务器后台写入",
-                    "uploading"
-            );
+            // With As-Task=true OpenList has accepted the request and created
+            // a background upload task. Poll that task until the actual storage
+            // write succeeds, instead of guessing from file visibility.
+            JSONObject task =
+                    json.optJSONObject("data") == null
+                            ? null
+                            : json.optJSONObject("data")
+                                    .optJSONObject("task");
 
-            boolean overwriteVisible = overwrite;
+            String taskId =
+                    task == null
+                            ? ""
+                            : task.optString("id", "");
 
+            if (!taskId.isEmpty()) {
+                updateProgress(
+                        index,
+                        total,
+                        displayName,
+                        99,
+                        "服务器后台写入",
+                        "uploading"
+                );
+
+                for (int poll = 0;
+                        poll < AS_TASK_MAX_POLLS;
+                        poll++) {
+                    TaskResult taskResult =
+                            getUploadTaskInfo(
+                                    base,
+                                    token,
+                                    taskId
+                            );
+
+                    if (taskResult.data != null) {
+                        double taskProgress =
+                                taskResult.data.optDouble(
+                                        "progress",
+                                        -1.0
+                                );
+
+                        if (taskProgress >= 0.0) {
+                            updateProgress(
+                                    index,
+                                    total,
+                                    displayName,
+                                    Math.max(
+                                            99,
+                                            Math.min(
+                                                    99,
+                                                    (int) taskProgress
+                                            )
+                                    ),
+                                    "服务器后台写入 · " +
+                                            String.format(
+                                                    Locale.US,
+                                                    "%.1f",
+                                                    taskProgress
+                                            ) +
+                                            "%",
+                                    "uploading"
+                            );
+                        }
+
+                        String state =
+                                taskResult.data.optString(
+                                        "state",
+                                        ""
+                                );
+
+                        if ("succeeded".equalsIgnoreCase(state)) {
+                            if (fileReady(
+                                    base,
+                                    token,
+                                    target,
+                                    size,
+                                    overwrite
+                            )) {
+                                return;
+                            }
+                        }
+
+                        if ("failed".equalsIgnoreCase(state) ||
+                                "canceled".equalsIgnoreCase(state) ||
+                                "canceling".equalsIgnoreCase(state) ||
+                                "errored".equalsIgnoreCase(state)) {
+                            throw new IOException(
+                                    "服务器后台任务失败：" +
+                                            taskResult.data.optString(
+                                                    "error",
+                                                    taskResult.data.optString(
+                                                            "status",
+                                                            state
+                                                    )
+                                            )
+                            );
+                        }
+                    }
+
+                    Thread.sleep(
+                            AS_TASK_POLL_MS
+                    );
+                }
+
+                throw new IOException(
+                        "服务器后台任务处理超时"
+                );
+            }
+
+            // Older/custom OpenList builds may accept As-Task but omit the
+            // task object. Fall back to polling the final object.
             for (int poll = 0;
                     poll < AS_TASK_MAX_POLLS;
                     poll++) {
@@ -931,16 +1020,8 @@ public class UploadService extends Service {
                         token,
                         target,
                         size,
-                        overwriteVisible
+                        overwrite
                 )) {
-                    updateProgress(
-                            index,
-                            total,
-                            displayName,
-                            100,
-                            "上传完成",
-                            "completed"
-                    );
                     return;
                 }
 
@@ -956,6 +1037,58 @@ public class UploadService extends Service {
             if (conn != null) {
                 conn.disconnect();
             }
+        }
+    }
+
+    private TaskResult getUploadTaskInfo(
+            String base,
+            String token,
+            String taskId
+    ) {
+        try {
+            HttpResult result =
+                    requestJson(
+                            "POST",
+                            base +
+                                    "/api/task/upload/info?tid=" +
+                                    Uri.encode(taskId),
+                            token,
+                            "{}"
+                    );
+
+            if (result.httpCode < 200 ||
+                    result.httpCode >= 300 ||
+                    result.body.isEmpty()) {
+                return new TaskResult(
+                        result.httpCode,
+                        null
+                );
+            }
+
+            JSONObject json =
+                    new JSONObject(
+                            result.body
+                    );
+
+            if (json.optInt(
+                    "code",
+                    result.httpCode
+            ) != 200) {
+                return new TaskResult(
+                        json.optInt(
+                                "code",
+                                result.httpCode
+                        ),
+                        null
+                );
+            }
+
+            return new TaskResult(
+                    result.httpCode,
+                    json.optJSONObject("data")
+            );
+        } catch (Exception ignored) {
+            return new TaskResult(-1, null);
         }
     }
 
@@ -2062,6 +2195,16 @@ public class UploadService extends Service {
         return sb.length() == 0
                 ? e.getClass().getSimpleName()
                 : sb.toString();
+    }
+
+    private static final class TaskResult {
+        final int httpCode;
+        final JSONObject data;
+
+        TaskResult(int httpCode, JSONObject data) {
+            this.httpCode = httpCode;
+            this.data = data;
+        }
     }
 
     private static final class BatchProgress {
