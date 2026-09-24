@@ -429,13 +429,10 @@ public class UploadService extends Service {
             totalChunks = (int) ((size + chunkSize - 1) / chunkSize);
         }
 
-        CompletionService<ChunkUploadResult> completion =
-                new ExecutorCompletionService<>(
-                        Executors.newFixedThreadPool(MAX_PARALLEL_CHUNKS)
-                );
         ExecutorService chunkExecutor =
-                ((ExecutorCompletionService<ChunkUploadResult>) completion)
-                        .executor;
+                Executors.newFixedThreadPool(MAX_PARALLEL_CHUNKS);
+        CompletionService<ChunkUploadResult> completion =
+                new ExecutorCompletionService<>(chunkExecutor);
         List<Future<ChunkUploadResult>> futures = new ArrayList<>();
 
         long completedBytes = 0;
