@@ -64,6 +64,8 @@ public class UploadService extends Service {
     private static final int MAX_FILE_PARALLEL = 4;
     private static final int CHUNK_RETRIES = 3;
     private static final int PROGRESS_WRITE_SIZE = 128 * 1024;
+    private static final long AS_TASK_POLL_MS = 2000L;
+    private static final int AS_TASK_MAX_POLLS = 900;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private volatile BatchProgress activeBatchProgress;
@@ -774,45 +776,80 @@ public class UploadService extends Service {
 
             conn.setRequestMethod("PUT");
             conn.setConnectTimeout(15000);
+            // The foreground connection only uploads bytes into OpenList's
+            // task cache. The actual storage write happens server-side after
+            // the request is accepted, so don't impose a response deadline.
             conn.setReadTimeout(0);
+            conn.setDoInput(true);
             conn.setDoOutput(true);
 
             conn.setRequestProperty("Authorization", token);
-            conn.setRequestProperty("File-Path", Uri.encode(target, "/"));
-            conn.setRequestProperty("As-Task", "false");
-            conn.setRequestProperty("Overwrite", overwrite ? "true" : "false");
-            conn.setRequestProperty("Content-Type", "application/octet-stream");
+            conn.setRequestProperty(
+                    "File-Path",
+                    Uri.encode(target, "/")
+            );
+            conn.setRequestProperty("As-Task", "true");
+            conn.setRequestProperty(
+                    "Overwrite",
+                    overwrite ? "true" : "false"
+            );
+            conn.setRequestProperty(
+                    "Content-Type",
+                    "application/octet-stream"
+            );
 
             if (size >= 0) {
-                conn.setRequestProperty("X-File-Size", Long.toString(size));
+                conn.setRequestProperty(
+                        "X-File-Size",
+                        Long.toString(size)
+                );
                 conn.setFixedLengthStreamingMode(size);
             } else {
-                conn.setChunkedStreamingMode(128 * 1024);
+                conn.setChunkedStreamingMode(
+                        PROGRESS_WRITE_SIZE
+                );
             }
 
-            try (InputStream raw = getContentResolver().openInputStream(uri)) {
-                if (raw == null) throw new IOException("无法读取文件");
+            try (
+                    InputStream raw =
+                            getContentResolver().openInputStream(uri)
+            ) {
+                if (raw == null) {
+                    throw new IOException(
+                            "无法读取文件"
+                    );
+                }
 
-                try (InputStream in = new BufferedInputStream(raw, 128 * 1024);
-                     OutputStream out = conn.getOutputStream()) {
-
-                    byte[] buffer = new byte[128 * 1024];
-                    long sent = 0;
-                    long lastUpdate = 0;
+                try (
+                        InputStream in =
+                                new BufferedInputStream(
+                                        raw,
+                                        PROGRESS_WRITE_SIZE
+                                );
+                        OutputStream out =
+                                conn.getOutputStream()
+                ) {
+                    byte[] buffer =
+                            new byte[PROGRESS_WRITE_SIZE];
+                    long sent = 0L;
+                    long lastUpdate = 0L;
                     int read;
 
                     while ((read = in.read(buffer)) != -1) {
                         out.write(buffer, 0, read);
                         sent += read;
 
-                        long now = System.currentTimeMillis();
+                        long now =
+                                System.currentTimeMillis();
 
                         if (size > 0 &&
-                                (now - lastUpdate >= 300 || sent == size)) {
-                            int progress = (int) Math.min(
-                                    100L,
-                                    sent * 100L / size
-                            );
+                                (now - lastUpdate >= 250L ||
+                                        sent == size)) {
+                            int progress =
+                                    (int) Math.min(
+                                            99L,
+                                            sent * 100L / size
+                                    );
 
                             lastUpdate = now;
 
@@ -824,6 +861,8 @@ public class UploadService extends Service {
                             );
                         }
                     }
+
+                    out.flush();
                 }
             }
 
@@ -839,23 +878,148 @@ public class UploadService extends Service {
                 );
             }
 
-            JSONObject json = body.isEmpty()
-                    ? new JSONObject()
-                    : new JSONObject(body);
+            JSONObject json =
+                    body.isEmpty()
+                            ? new JSONObject()
+                            : new JSONObject(body);
 
-            int apiCode = json.optInt("code", code);
+            int apiCode =
+                    json.optInt(
+                            "code",
+                            code
+                    );
 
             if (apiCode != 200) {
                 throw new IOException(
                         "OpenList 上传失败 " +
                                 apiCode +
                                 "：" +
-                                json.optString("message", body)
+                                json.optString(
+                                        "message",
+                                        body
+                                )
                 );
             }
+
+            // With As-Task=true OpenList has only accepted/cached the request
+            // at this point. Wait until the actual object is visible before
+            // generating the final direct link.
+            updateProgress(
+                    index,
+                    total,
+                    displayName,
+                    Math.max(
+                            99,
+                            size > 0
+                                    ? (int) Math.min(
+                                            99L,
+                                            size * 100L / size
+                                    )
+                                    : 99
+                    ),
+                    "服务器后台写入",
+                    "uploading"
+            );
+
+            boolean overwriteVisible = overwrite;
+
+            for (int poll = 0;
+                    poll < AS_TASK_MAX_POLLS;
+                    poll++) {
+                if (fileReady(
+                        base,
+                        token,
+                        target,
+                        size,
+                        overwriteVisible
+                )) {
+                    updateProgress(
+                            index,
+                            total,
+                            displayName,
+                            100,
+                            "上传完成",
+                            "completed"
+                    );
+                    return;
+                }
+
+                Thread.sleep(
+                        AS_TASK_POLL_MS
+                );
+            }
+
+            throw new IOException(
+                    "服务器后台任务处理超时"
+            );
         } finally {
-            if (conn != null) conn.disconnect();
+            if (conn != null) {
+                conn.disconnect();
+            }
         }
+    }
+
+    private boolean fileReady(
+            String base,
+            String token,
+            String target,
+            long expectedSize,
+            boolean overwrite
+    ) throws Exception {
+        String body =
+                new JSONObject()
+                        .put("path", target)
+                        .put("password", "")
+                        .toString();
+
+        HttpResult result =
+                requestJson(
+                        "POST",
+                        base + "/api/fs/get",
+                        token,
+                        body
+                );
+
+        if (result.httpCode == 404) {
+            return false;
+        }
+
+        if (result.httpCode < 200 ||
+                result.httpCode >= 300) {
+            return false;
+        }
+
+        JSONObject json =
+                result.body.isEmpty()
+                        ? new JSONObject()
+                        : new JSONObject(result.body);
+
+        if (json.optInt(
+                "code",
+                result.httpCode
+        ) != 200) {
+            return false;
+        }
+
+        JSONObject data =
+                json.optJSONObject("data");
+
+        if (data == null) {
+            return false;
+        }
+
+        long actualSize =
+                data.optLong(
+                        "size",
+                        -1L
+                );
+
+        // Some storage drivers may not expose size immediately. Existence
+        // is enough once As-Task has accepted the whole request; when size is
+        // available, require it to match to avoid linking a stale object.
+        return actualSize < 0L ||
+                expectedSize < 0L ||
+                actualSize == expectedSize;
     }
 
     private void multipartUpload(
