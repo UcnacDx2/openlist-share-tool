@@ -39,9 +39,17 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicIntegerArray;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 
 public class UploadService extends Service {
+    public static final String EXTRA_FROM_SHARE = "from_share";
+
     private static final String CHANNEL_ID = "openlist_uploads";
     private static final int NOTIFICATION_ID = 20260924;
     private static final int PAGE_SIZE = 1000;
@@ -56,6 +64,8 @@ public class UploadService extends Service {
     private static final int PROGRESS_WRITE_SIZE = 128 * 1024;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private volatile BatchProgress activeBatchProgress;
+    private ScheduledExecutorService progressScheduler;
 
     @Override
     public void onCreate() {
@@ -74,11 +84,24 @@ public class UploadService extends Service {
             return START_NOT_STICKY;
         }
 
+        boolean fromShare =
+                intent != null &&
+                        intent.getBooleanExtra(
+                                EXTRA_FROM_SHARE,
+                                false
+                        );
+
         startForeground(
                 NOTIFICATION_ID,
                 buildNotification(
                         "OpenList 快传",
-                        "准备上传 " + uris.size() + " 个文件",
+                        fromShare
+                                ? "已收到分享： " +
+                                        uris.size() +
+                                        " 个文件，准备上传"
+                                : "准备上传 " +
+                                        uris.size() +
+                                        " 个文件",
                         0,
                         true,
                         ""
@@ -99,6 +122,7 @@ public class UploadService extends Service {
 
     @Override
     public void onDestroy() {
+        stopProgressScheduler();
         executor.shutdownNow();
         super.onDestroy();
     }
@@ -167,7 +191,15 @@ public class UploadService extends Service {
             return;
         }
 
-        initializeProgress(uris);
+        BatchProgress batchProgress =
+                new BatchProgress(uris.size());
+
+        activeBatchProgress = batchProgress;
+        initializeProgress(batchProgress, uris);
+        startProgressScheduler(
+                batchProgress,
+                uris.size()
+        );
 
         Set<String> reservedTargets =
                 Collections.synchronizedSet(new HashSet<>());
@@ -211,12 +243,20 @@ public class UploadService extends Service {
                 }
             }
 
+            publishProgressNow(
+                    batchProgress,
+                    uris.size()
+            );
+            stopProgressScheduler();
             postBatchFinished(
+                    batchProgress,
                     uris.size(),
                     anyFailed
             );
         } finally {
             fileExecutor.shutdownNow();
+            stopProgressScheduler();
+            activeBatchProgress = null;
         }
     }
 
@@ -412,42 +452,172 @@ public class UploadService extends Service {
         return Math.max(min, Math.min(max, value));
     }
 
-    private void initializeProgress(List<Uri> uris) {
+    private void initializeProgress(
+            BatchProgress batchProgress,
+            List<Uri> uris
+    ) {
+        for (int i = 0; i < uris.size(); i++) {
+            Uri uri = uris.get(i);
+
+            batchProgress.names.set(
+                    i,
+                    sanitizeFileName(displayName(uri))
+            );
+            batchProgress.sizes[i] =
+                    Math.max(0L, sizeOf(uri));
+        }
+
+        publishProgressNow(
+                batchProgress,
+                uris.size()
+        );
+    }
+
+    private void startProgressScheduler(
+            BatchProgress batchProgress,
+            int total
+    ) {
+        progressScheduler =
+                new ScheduledThreadPoolExecutor(1);
+
+        progressScheduler.scheduleAtFixedRate(
+                () -> publishProgress(
+                        batchProgress,
+                        total
+                ),
+                0L,
+                250L,
+                TimeUnit.MILLISECONDS
+        );
+    }
+
+    private void stopProgressScheduler() {
+        ScheduledExecutorService scheduler =
+                progressScheduler;
+
+        progressScheduler = null;
+
+        if (scheduler != null) {
+            scheduler.shutdownNow();
+        }
+    }
+
+    private void publishProgressNow(
+            BatchProgress batchProgress,
+            int total
+    ) {
+        publishProgress(
+                batchProgress,
+                total
+        );
+    }
+
+    private void publishProgress(
+            BatchProgress batchProgress,
+            int total
+    ) {
+        JSONArray files = buildProgressJson(batchProgress);
+        persistProgress(files);
+        notifyUploadProgress(
+                files,
+                total
+        );
+    }
+
+    private synchronized void persistProgress(
+            JSONArray files
+    ) {
+        getSharedPreferences(
+                MainActivity.PREFS,
+                MODE_PRIVATE
+        ).edit()
+                .putString(
+                        MainActivity.KEY_UPLOAD_PROGRESS,
+                        files.toString()
+                )
+                .apply();
+    }
+
+    private JSONArray buildProgressJson(
+            BatchProgress batchProgress
+    ) {
         JSONArray files = new JSONArray();
 
-        for (Uri uri : uris) {
+        for (int i = 0;
+                i < batchProgress.total;
+                i++) {
             JSONObject item = new JSONObject();
 
             try {
+                String name =
+                        batchProgress.names.get(i);
+                String status =
+                        batchProgress.status.get(i);
+                String detail =
+                        batchProgress.detail.get(i);
+
+                int progress =
+                        batchProgress.progress.get(i);
+
+                long size =
+                        batchProgress.sizes[i];
+                long transferred =
+                        batchProgress.transferred.get(i);
+
+                if (size > 0 &&
+                        "uploading".equals(status)) {
+                    progress = Math.max(
+                            progress,
+                            Math.min(
+                                    99,
+                                    (int) (
+                                            transferred *
+                                                    100L /
+                                                    size
+                                    )
+                            )
+                    );
+                }
+
+                if ("completed".equals(status)) {
+                    progress = 100;
+                }
+
                 item.put(
                         "name",
-                        sanitizeFileName(displayName(uri))
+                        name == null
+                                ? "upload.bin"
+                                : name
                 );
                 item.put(
                         "size",
-                        Math.max(0L, sizeOf(uri))
+                        Math.max(0L, size)
                 );
-                item.put("progress", 0);
-                item.put("status", "pending");
-                item.put("detail", "等待上传");
+                item.put(
+                        "progress",
+                        progress
+                );
+                item.put(
+                        "status",
+                        status == null
+                                ? "pending"
+                                : status
+                );
+                item.put(
+                        "detail",
+                        detail == null
+                                ? ""
+                                : detail
+                );
             } catch (Exception ignored) {
             }
 
             files.put(item);
         }
 
-        synchronized (this) {
-            getSharedPreferences(
-                    MainActivity.PREFS,
-                    MODE_PRIVATE
-            ).edit()
-                    .putString(
-                            MainActivity.KEY_UPLOAD_PROGRESS,
-                            files.toString()
-                    )
-                    .apply();
-        }
+        return files;
     }
+
 
     private String timestampTarget(
             String base,
@@ -751,7 +921,6 @@ public class UploadService extends Service {
         List<Future<ChunkUploadResult>> futures = new ArrayList<>();
 
         AtomicLong transferredBytes = new AtomicLong(0);
-        AtomicLong lastProgressUpdate = new AtomicLong(0);
         int submitted = 0;
         int completed = 0;
         boolean allDone = false;
@@ -834,45 +1003,18 @@ public class UploadService extends Service {
                                             chunk,
                                             chunkLength,
                                             delta -> {
-                                                long current =
-                                                        transferredBytes.addAndGet(delta);
-                                                long now =
-                                                        System.currentTimeMillis();
-                                                long last =
-                                                        lastProgressUpdate.get();
+                                                BatchProgress batchProgress =
+                                                        activeBatchProgress;
 
-                                                if (delta < 0 ||
-                                                        now - last >= 250L ||
-                                                        current >= size - 1) {
-                                                    if (lastProgressUpdate.compareAndSet(
-                                                            last,
-                                                            now
-                                                    ) || delta < 0) {
-                                                        int progress =
-                                                                (int) Math.min(
-                                                                        99L,
-                                                                        Math.max(
-                                                                                0L,
-                                                                                current * 100L / size
-                                                                        )
-                                                                );
-
-                                                        updateProgress(
-                                                                index,
-                                                                total,
-                                                                displayName,
-                                                                progress,
-                                                                "正在上传 · 分片 " +
-                                                                        (chunkIndex + 1) +
-                                                                        "/" +
-                                                                        totalChunks +
-                                                                        " · " +
-                                                                        chunkParallel +
-                                                                        "路并行",
-                                                                "uploading"
-                                                        );
-                                                    }
+                                                if (batchProgress != null) {
+                                                    batchProgress.transferred
+                                                            .addAndGet(
+                                                                    index,
+                                                                    delta
+                                                            );
                                                 }
+
+                                                transferredBytes.addAndGet(delta);
                                             }
                                     );
 
@@ -1413,7 +1555,7 @@ public class UploadService extends Service {
         return 49;
     }
 
-    private synchronized void updateProgress(
+    private void updateProgress(
             int index,
             int total,
             String name,
@@ -1429,7 +1571,7 @@ public class UploadService extends Service {
         );
     }
 
-    private synchronized void updateProgress(
+    private void updateProgress(
             int index,
             int total,
             String name,
@@ -1437,52 +1579,33 @@ public class UploadService extends Service {
             String detail,
             String status
     ) {
-        SharedPreferences prefs =
-                getSharedPreferences(
-                        MainActivity.PREFS,
-                        MODE_PRIVATE
-                );
+        BatchProgress batchProgress =
+                activeBatchProgress;
 
-        String raw = prefs.getString(
-                MainActivity.KEY_UPLOAD_PROGRESS,
-                ""
-        );
-
-        if (raw.isEmpty()) return;
-
-        try {
-            JSONArray files = new JSONArray(raw);
-
-            if (index < 0 || index >= files.length()) return;
-
-            JSONObject item = files.optJSONObject(index);
-            if (item == null) return;
-
-            item.put("name", name);
-            item.put(
-                    "progress",
-                    Math.max(
-                            0,
-                            Math.min(100, fileProgress)
-                    )
-            );
-            item.put("status", status);
-            item.put(
-                    "detail",
-                    detail == null ? "" : detail
-            );
-
-            prefs.edit()
-                    .putString(
-                            MainActivity.KEY_UPLOAD_PROGRESS,
-                            files.toString()
-                    )
-                    .apply();
-
-            notifyUploadProgress(files, total);
-        } catch (Exception ignored) {
+        if (batchProgress == null ||
+                index < 0 ||
+                index >= batchProgress.total) {
+            return;
         }
+
+        batchProgress.names.set(index, name);
+        batchProgress.progress.set(
+                index,
+                Math.max(
+                        0,
+                        Math.min(100, fileProgress)
+                )
+        );
+        batchProgress.status.set(
+                index,
+                status
+        );
+        batchProgress.detail.set(
+                index,
+                detail == null ? "" : detail
+        );
     }
+
 
     private void notifyUploadProgress(
             JSONArray files,
@@ -1578,21 +1701,13 @@ public class UploadService extends Service {
     }
 
     private void postBatchFinished(
+            BatchProgress batchProgress,
             int total,
             boolean anyFailed
     ) {
-        String raw = getSharedPreferences(
-                MainActivity.PREFS,
-                MODE_PRIVATE
-        ).getString(
-                MainActivity.KEY_UPLOAD_PROGRESS,
-                ""
-        );
-
-        if (raw.isEmpty()) return;
+        JSONArray files = buildProgressJson(batchProgress);
 
         try {
-            JSONArray files = new JSONArray(raw);
             int completed = 0;
             int failed = 0;
 
@@ -1653,8 +1768,15 @@ public class UploadService extends Service {
             boolean ongoing,
             String link
     ) {
-        Intent openIntent = new Intent(this, MainActivity.class);
-        PendingIntent openPending = PendingIntent.getActivity(
+        Intent openIntent =
+                new Intent(this, MainActivity.class);
+        openIntent.addFlags(
+                Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP |
+                        Intent.FLAG_ACTIVITY_NEW_TASK
+        );
+        PendingIntent openPending =
+                PendingIntent.getActivity(
                 this,
                 1,
                 openIntent,
@@ -2010,6 +2132,32 @@ public class UploadService extends Service {
         return sb.length() == 0
                 ? e.getClass().getSimpleName()
                 : sb.toString();
+    }
+
+    private static final class BatchProgress {
+        final int total;
+        final long[] sizes;
+        final AtomicLongArray transferred;
+        final AtomicIntegerArray progress;
+        final AtomicReferenceArray<String> names;
+        final AtomicReferenceArray<String> status;
+        final AtomicReferenceArray<String> detail;
+
+        BatchProgress(int total) {
+            this.total = total;
+            sizes = new long[total];
+            transferred = new AtomicLongArray(total);
+            progress = new AtomicIntegerArray(total);
+            names = new AtomicReferenceArray<>(total);
+            status = new AtomicReferenceArray<>(total);
+            detail = new AtomicReferenceArray<>(total);
+
+            for (int i = 0; i < total; i++) {
+                names.set(i, "upload.bin");
+                status.set(i, "pending");
+                detail.set(i, "等待上传");
+            }
+        }
     }
 
     private static final class ChunkUploadResult {
