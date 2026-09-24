@@ -449,6 +449,140 @@ public class UploadService extends Service {
         }
     }
 
+    private String timestampTarget(
+            String base,
+            String token,
+            String dir,
+            String originalName
+    ) throws Exception {
+        String stamp = new SimpleDateFormat(
+                "yyyy-MM-dd HH-mm-ss",
+                Locale.getDefault()
+        ).format(new Date());
+
+        String candidate = appendTimestamp(
+                originalName,
+                stamp
+        );
+
+        int serial = 2;
+
+        while (exists(
+                base,
+                token,
+                joinPath(dir, candidate)
+        )) {
+            candidate = appendTimestamp(
+                    originalName,
+                    stamp + " #" + serial++
+            );
+        }
+
+        return joinPath(dir, candidate);
+    }
+
+    private boolean exists(
+            String base,
+            String token,
+            String target
+    ) throws Exception {
+        String dir = parentPath(target);
+        String name = baseName(target);
+        int page = 1;
+
+        while (page <= 10000) {
+            JSONObject req = new JSONObject();
+            req.put("path", dir);
+            req.put("password", "");
+            req.put("page", page);
+            req.put("per_page", PAGE_SIZE);
+            req.put("refresh", false);
+
+            HttpResult result = requestJson(
+                    "POST",
+                    base + "/api/fs/list",
+                    token,
+                    req.toString()
+            );
+
+            if (result.httpCode < 200 ||
+                    result.httpCode >= 300) {
+                throw new IOException(
+                        "检查重名失败 HTTP " +
+                                result.httpCode +
+                                "：" +
+                                safeMessage(result.body)
+                );
+            }
+
+            JSONObject json =
+                    new JSONObject(result.body);
+            int code = json.optInt(
+                    "code",
+                    result.httpCode
+            );
+
+            if (code != 200) {
+                throw new IOException(
+                        "检查重名失败 " +
+                                code +
+                                "：" +
+                                json.optString(
+                                        "message",
+                                        result.body
+                                )
+                );
+            }
+
+            JSONObject data =
+                    json.optJSONObject("data");
+
+            if (data == null) return false;
+
+            JSONArray content =
+                    data.optJSONArray("content");
+
+            int reportedTotal =
+                    data.optInt(
+                            "total",
+                            content == null
+                                    ? 0
+                                    : content.length()
+                    );
+
+            if (content != null) {
+                for (int i = 0;
+                        i < content.length();
+                        i++) {
+                    JSONObject item =
+                            content.optJSONObject(i);
+
+                    if (item != null &&
+                            name.equals(
+                                    item.optString(
+                                            "name",
+                                            ""
+                                    )
+                            )) {
+                        return true;
+                    }
+                }
+            }
+
+            if (content == null ||
+                    content.length() == 0 ||
+                    page * PAGE_SIZE >= reportedTotal) {
+                return false;
+            }
+
+            page++;
+        }
+
+        throw new IOException(
+                "目录文件过多，无法安全检查同名文件"
+        );
+    }
+
     private void uploadOne(
             String base,
             String token,
@@ -576,7 +710,8 @@ public class UploadService extends Service {
                 token,
                 target,
                 overwrite,
-                size
+                size,
+                chunkSize
         );
 
         String uploadId = initData.optString("upload_id", "");
@@ -865,7 +1000,8 @@ public class UploadService extends Service {
             String token,
             String target,
             boolean overwrite,
-            long size
+            long size,
+            long chunkSize
     ) throws Exception {
         HttpURLConnection conn = null;
 
