@@ -225,7 +225,7 @@ public class MainActivity extends Activity {
         root.addView(lastLinkText, matchWrap());
 
         copyButton = new Button(this);
-        copyButton.setText("复制直链");
+        copyButton.setText("复制直链（有远端地址则优先）");
         copyButton.setEnabled(false);
         root.addView(copyButton, matchWrap());
 
@@ -712,12 +712,41 @@ public class MainActivity extends Activity {
             return;
         }
 
-        ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+        String remoteBase = remoteBaseInput.getText().toString().trim();
+        if (!remoteBase.isEmpty()) {
+            try {
+                url = replaceLinkOrigin(url, remoteBase);
+            } catch (Exception e) {
+                Toast.makeText(
+                        this,
+                        "远端地址无效：" + e.getMessage(),
+                        Toast.LENGTH_SHORT
+                ).show();
+                return;
+            }
+        }
+
+        ClipboardManager clipboard =
+                (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (clipboard != null) {
-            clipboard.setPrimaryClip(ClipData.newPlainText("OpenList 直链", url));
-            Toast.makeText(this, "直链已复制", Toast.LENGTH_SHORT).show();
+            clipboard.setPrimaryClip(
+                    ClipData.newPlainText(
+                            remoteBase.isEmpty()
+                                    ? "OpenList 直链"
+                                    : "OpenList 远端直链",
+                            url
+                    )
+            );
+            Toast.makeText(
+                    this,
+                    remoteBase.isEmpty()
+                            ? "直链已复制"
+                            : "远端直链已复制",
+                    Toast.LENGTH_SHORT
+            ).show();
         }
     }
+
 
     private void shareLastUrl() {
         String url = getLastUrl();
@@ -744,28 +773,7 @@ public class MainActivity extends Activity {
         }
 
         try {
-            URI source = new URI(url);
-            URI remote = new URI(normalizedBase(remoteBase));
-
-            if (source.getScheme() == null || source.getHost() == null) {
-                throw new IllegalArgumentException("最近一次直链不是标准 HTTP 地址");
-            }
-
-            if (remote.getScheme() == null || remote.getHost() == null ||
-                    (!"http".equalsIgnoreCase(remote.getScheme()) &&
-                            !"https".equalsIgnoreCase(remote.getScheme()))) {
-                throw new IllegalArgumentException("远端地址必须是 http:// 或 https://");
-            }
-
-            String replaced = new URI(
-                    remote.getScheme(),
-                    remote.getUserInfo(),
-                    remote.getHost(),
-                    remote.getPort(),
-                    source.getPath(),
-                    source.getQuery(),
-                    source.getFragment()
-            ).toString();
+            String replaced = replaceLinkOrigin(url, remoteBase);
 
             ClipboardManager clipboard =
                     (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
@@ -774,7 +782,9 @@ public class MainActivity extends Activity {
                         ClipData.newPlainText("OpenList 远端直链", replaced)
                 );
                 Toast.makeText(this, "远端直链已复制", Toast.LENGTH_SHORT).show();
-                statusText.setText("已替换域名/端口并复制：\n" + replaced);
+                statusText.setText(
+                        "已替换域名/端口并复制：\n" + replaced
+                );
             }
         } catch (Exception e) {
             Toast.makeText(
@@ -783,6 +793,39 @@ public class MainActivity extends Activity {
                     Toast.LENGTH_SHORT
             ).show();
         }
+    }
+
+    private String replaceLinkOrigin(
+            String sourceUrl,
+            String remoteBase
+    ) throws Exception {
+        URI source = new URI(sourceUrl);
+        URI remote = new URI(normalizedBase(remoteBase));
+
+        if (source.getScheme() == null || source.getHost() == null) {
+            throw new IllegalArgumentException(
+                    "最近一次直链不是标准 HTTP 地址"
+            );
+        }
+
+        if (remote.getScheme() == null ||
+                remote.getHost() == null ||
+                (!"http".equalsIgnoreCase(remote.getScheme()) &&
+                        !"https".equalsIgnoreCase(remote.getScheme()))) {
+            throw new IllegalArgumentException(
+                    "远端地址必须是 http:// 或 https://"
+            );
+        }
+
+        return new URI(
+                remote.getScheme(),
+                remote.getUserInfo(),
+                remote.getHost(),
+                remote.getPort(),
+                source.getPath(),
+                source.getQuery(),
+                source.getFragment()
+        ).toString();
     }
 
     private String normalizedBase(String value) {
