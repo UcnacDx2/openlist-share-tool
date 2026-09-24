@@ -45,7 +45,7 @@ public final class MultipartUploader {
         );
     }
 
-    private static final int INFLIGHT = 3;
+    private static final int DEFAULT_INFLIGHT = 3;
     private static final int MAX_FLOW_RETRIES = 400;
     private static final int BUFFER_SIZE = 256 * 1024;
     private static final long RETRY_BASE_MS = 800L;
@@ -80,6 +80,7 @@ public final class MultipartUploader {
             boolean overwrite,
             long size,
             long requestedChunkSize,
+            int requestedInflight,
             Listener listener
     ) throws Exception {
         if (size <= 0) {
@@ -141,6 +142,13 @@ public final class MultipartUploader {
             return;
         }
 
+        final int inflight = Math.max(
+                1,
+                Math.min(8, requestedInflight > 0
+                        ? requestedInflight
+                        : DEFAULT_INFLIGHT)
+        );
+
         ChunkSource source = ChunkSource.open(
                 context,
                 resolver,
@@ -172,7 +180,7 @@ public final class MultipartUploader {
                     new ConcurrentHashMap<>();
 
             final int workerCount =
-                    Math.min(INFLIGHT, missing.size());
+                    Math.min(inflight, missing.size());
 
             ExecutorService workers =
                     Executors.newFixedThreadPool(workerCount);
@@ -211,7 +219,8 @@ public final class MultipartUploader {
                                             peakBytes,
                                             attemptLoaded,
                                             lastReportAt,
-                                            listener
+                                            listener,
+                                            inflight
                                     );
                                 }
                             })
@@ -258,7 +267,8 @@ public final class MultipartUploader {
             AtomicLong peakBytes,
             ConcurrentMap<Integer, AtomicLong> attemptLoaded,
             AtomicLong lastReportAt,
-            Listener listener
+            Listener listener,
+            int inflight
     ) throws Exception {
         long chunkLength =
                 Math.min(
@@ -314,6 +324,13 @@ public final class MultipartUploader {
                 if (apiCode == 200 &&
                         httpCode >= 200 &&
                         httpCode < 300) {
+                    long sent =
+                            loaded.getAndSet(0L);
+
+                    if (sent != 0L) {
+                        inFlightBytes.addAndGet(-sent);
+                    }
+
                     long acked =
                             ackedBytes.addAndGet(chunkLength);
 
@@ -329,7 +346,7 @@ public final class MultipartUploader {
                                     "/" +
                                     totalChunks +
                                     " · " +
-                                    INFLIGHT +
+                                    inflight +
                                     "路并行"
                     );
 
@@ -725,9 +742,7 @@ public final class MultipartUploader {
             String body = responseBody(response);
 
             if (response.code() == 404) {
-                JSONObject done = new JSONObject();
-                done.put("state", "completed");
-                return done;
+                return null;
             }
 
             if (!response.isSuccessful() ||
