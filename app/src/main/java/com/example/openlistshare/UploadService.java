@@ -30,18 +30,25 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 public class UploadService extends Service {
     private static final String CHANNEL_ID = "openlist_uploads";
     private static final int NOTIFICATION_ID = 20260924;
     private static final int PAGE_SIZE = 1000;
     private static final int LARGE_FILE_THRESHOLD = 8 * 1024 * 1024;
-    // Keep each HTTP request small enough for common reverse-proxy limits.
-    // OpenList's multipart implementation accepts 1 MiB as its minimum chunk size.
-    private static final int REQUESTED_CHUNK_SIZE = 1 * 1024 * 1024;
+    // 8 MiB is below OpenList's default 10 MiB multipart ceiling while
+    // greatly reducing HTTP request overhead versus 1 MiB chunks.
+    private static final int REQUESTED_CHUNK_SIZE = 8 * 1024 * 1024;
     private static final int CHUNK_RETRIES = 3;
+    // OpenList currently accepts concurrent/out-of-order chunks within an
+    // 8-slot receive window. Four workers leave headroom for retries/control.
+    private static final int MAX_PARALLEL_CHUNKS = 4;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
 
@@ -399,7 +406,6 @@ public class UploadService extends Service {
 
         updateProgress(index, total, displayName, 0);
 
-        JSONObject init = new JSONObject();
         JSONObject initData = multipartInit(
                 base,
                 token,
@@ -414,18 +420,28 @@ public class UploadService extends Service {
         }
 
         long chunkSize = initData.optLong("chunk_size", REQUESTED_CHUNK_SIZE);
-        if (chunkSize <= 0) {
-            throw new IOException("OpenList 返回了无效的分片大小：" + chunkSize);
+        if (chunkSize <= 0 || chunkSize > 64L * 1024L * 1024L) {
+            throw new IOException("OpenList 返回了异常的分片大小：" + chunkSize);
         }
 
-        int totalChunks = initData.optInt(
-                "total_chunks",
-                (int) ((size + chunkSize - 1) / chunkSize)
-        );
+        int totalChunks = initData.optInt("total_chunks", 0);
+        if (totalChunks <= 0) {
+            totalChunks = (int) ((size + chunkSize - 1) / chunkSize);
+        }
 
-        byte[] buffer = new byte[(int) Math.min(chunkSize, Integer.MAX_VALUE)];
-        long uploadedBefore = 0;
-        int completedChunks = 0;
+        CompletionService<ChunkUploadResult> completion =
+                new ExecutorCompletionService<>(
+                        Executors.newFixedThreadPool(MAX_PARALLEL_CHUNKS)
+                );
+        ExecutorService chunkExecutor =
+                ((ExecutorCompletionService<ChunkUploadResult>) completion)
+                        .executor;
+        List<Future<ChunkUploadResult>> futures = new ArrayList<>();
+
+        long completedBytes = 0;
+        int submitted = 0;
+        int completed = 0;
+        boolean allDone = false;
 
         try (InputStream raw = getContentResolver().openInputStream(uri)) {
             if (raw == null) {
@@ -434,13 +450,44 @@ public class UploadService extends Service {
 
             InputStream in = new BufferedInputStream(raw, 128 * 1024);
 
-            for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+            while (submitted < totalChunks) {
+                while (submitted - completed >= MAX_PARALLEL_CHUNKS) {
+                    ChunkUploadResult result = awaitChunk(completion);
+                    completed++;
+                    completedBytes += result.length;
+
+                    updateProgress(
+                            index,
+                            total,
+                            displayName +
+                                    " · 分片 " +
+                                    (result.index + 1) +
+                                    "/" +
+                                    totalChunks +
+                                    " · 4路并行",
+                            (int) Math.min(
+                                    100L,
+                                    completedBytes * 100L / size
+                            )
+                    );
+                }
+
+                int chunkIndex = submitted;
+                long chunkOffset = (long) chunkIndex * chunkSize;
                 int expected = (int) Math.min(
                         chunkSize,
-                        size - uploadedBefore
+                        size - chunkOffset
                 );
 
+                if (expected <= 0) {
+                    throw new IOException(
+                            "OpenList 返回的 total_chunks 与文件大小不匹配"
+                    );
+                }
+
+                byte[] buffer = new byte[expected];
                 int actual = readChunk(in, buffer, expected);
+
                 if (actual != expected) {
                     throw new IOException(
                             "文件读取不完整：第 " +
@@ -455,88 +502,89 @@ public class UploadService extends Service {
                     );
                 }
 
-                long chunkStart = uploadedBefore;
-                Exception lastError = null;
-                boolean success = false;
+                final byte[] chunk = buffer;
+                final int chunkLength = actual;
 
-                for (int attempt = 1; attempt <= CHUNK_RETRIES; attempt++) {
-                    try {
-                        multipartChunk(
-                                base,
-                                token,
-                                uploadId,
-                                chunkIndex,
-                                buffer,
-                                actual,
-                                index,
-                                total,
-                                displayName,
-                                chunkStart,
-                                size
-                        );
-                        success = true;
-                        break;
-                    } catch (Exception e) {
-                        lastError = e;
-                        updateProgress(
-                                index,
-                                total,
-                                displayName +
-                                        " · 第 " +
-                                        (chunkIndex + 1) +
-                                        "/" +
-                                        totalChunks +
-                                        " 片重试 " +
-                                        attempt +
-                                        "/" +
-                                        CHUNK_RETRIES,
-                                (int) Math.min(
-                                        100L,
-                                        (chunkStart * 100L) / size
-                                )
-                        );
+                futures.add(
+                        completion.submit(() -> {
+                            Exception lastError = null;
 
-                        if (attempt < CHUNK_RETRIES) {
-                            try {
-                                Thread.sleep(1000L);
-                            } catch (InterruptedException interrupted) {
-                                Thread.currentThread().interrupt();
-                                throw new IOException("上传被中断", interrupted);
+                            for (int attempt = 1; attempt <= CHUNK_RETRIES; attempt++) {
+                                try {
+                                    multipartChunk(
+                                            base,
+                                            token,
+                                            uploadId,
+                                            chunkIndex,
+                                            chunk,
+                                            chunkLength
+                                    );
+
+                                    return new ChunkUploadResult(
+                                            chunkIndex,
+                                            chunkLength
+                                    );
+                                } catch (Exception e) {
+                                    lastError = e;
+
+                                    if (attempt < CHUNK_RETRIES) {
+                                        try {
+                                            Thread.sleep(1000L);
+                                        } catch (InterruptedException interrupted) {
+                                            Thread.currentThread().interrupt();
+                                            throw new IOException(
+                                                    "上传被中断",
+                                                    interrupted
+                                            );
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    }
-                }
 
-                if (!success) {
-                    throw new IOException(
-                            "第 " +
-                                    (chunkIndex + 1) +
-                                    "/" +
-                                    totalChunks +
-                                    " 片上传失败：" +
-                                    friendlyError(lastError)
-                    );
-                }
-
-                uploadedBefore += actual;
-                completedChunks++;
-
-                int progress = (int) Math.min(
-                        100L,
-                        uploadedBefore * 100L / size
+                            throw new IOException(
+                                    "第 " +
+                                            (chunkIndex + 1) +
+                                            "/" +
+                                            totalChunks +
+                                            " 片上传失败：" +
+                                            friendlyError(lastError)
+                            );
+                        })
                 );
+
+                submitted++;
+            }
+
+            while (completed < submitted) {
+                ChunkUploadResult result = awaitChunk(completion);
+                completed++;
+                completedBytes += result.length;
 
                 updateProgress(
                         index,
                         total,
                         displayName +
                                 " · 分片 " +
-                                completedChunks +
+                                (result.index + 1) +
                                 "/" +
-                                totalChunks,
-                        progress
+                                totalChunks +
+                                " · 4路并行",
+                        (int) Math.min(
+                                100L,
+                                completedBytes * 100L / size
+                        )
                 );
             }
+
+            allDone = true;
+        } finally {
+            if (!allDone) {
+                for (Future<ChunkUploadResult> future : futures) {
+                    future.cancel(true);
+                }
+            }
+
+            chunkExecutor.shutdownNow();
         }
 
         JSONObject complete = multipartComplete(
@@ -560,6 +608,31 @@ public class UploadService extends Service {
                 displayName,
                 100
         );
+    }
+
+    private ChunkUploadResult awaitChunk(
+            CompletionService<ChunkUploadResult> completion
+    ) throws Exception {
+        try {
+            return completion.take().get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("上传被中断", e);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+
+            if (cause instanceof Exception) {
+                throw (Exception) cause;
+            }
+
+            throw new IOException(
+                    "分片上传线程异常：" +
+                            (cause == null
+                                    ? "未知错误"
+                                    : cause.getMessage()),
+                    cause
+            );
+        }
     }
 
     private JSONObject multipartInit(
@@ -650,12 +723,7 @@ public class UploadService extends Service {
             String uploadId,
             int chunkIndex,
             byte[] buffer,
-            int length,
-            int fileIndex,
-            int totalFiles,
-            String displayName,
-            long overallOffset,
-            long totalSize
+            int length
     ) throws Exception {
         HttpURLConnection conn = null;
 
@@ -671,37 +739,14 @@ public class UploadService extends Service {
             conn.setRequestProperty("Authorization", token);
             conn.setRequestProperty("X-Upload-Id", uploadId);
             conn.setRequestProperty("X-Chunk-Index", Integer.toString(chunkIndex));
-            conn.setRequestProperty("Content-Type", "application/octet-stream");
+            conn.setRequestProperty(
+                    "Content-Type",
+                    "application/octet-stream"
+            );
             conn.setFixedLengthStreamingMode(length);
 
             try (OutputStream out = conn.getOutputStream()) {
-                int offset = 0;
-                final int step = 64 * 1024;
-                long lastUpdate = System.currentTimeMillis();
-
-                while (offset < length) {
-                    int n = Math.min(step, length - offset);
-                    out.write(buffer, offset, n);
-                    offset += n;
-
-                    long now = System.currentTimeMillis();
-                    if (now - lastUpdate >= 250 || offset == length) {
-                        long uploaded = overallOffset + offset;
-                        int progress = (int) Math.min(
-                                100L,
-                                uploaded * 100L / totalSize
-                        );
-                        updateProgress(
-                                fileIndex,
-                                totalFiles,
-                                displayName +
-                                        " · 分片 " +
-                                        (chunkIndex + 1),
-                                progress
-                        );
-                        lastUpdate = now;
-                    }
-                }
+                out.write(buffer, 0, length);
             }
 
             int httpCode = conn.getResponseCode();
@@ -720,7 +765,9 @@ public class UploadService extends Service {
 
             JSONObject json;
             try {
-                json = body.isEmpty() ? new JSONObject() : new JSONObject(body);
+                json = body.isEmpty()
+                        ? new JSONObject()
+                        : new JSONObject(body);
             } catch (Exception e) {
                 throw new IOException(
                         "OpenList 分片 " +
@@ -734,6 +781,7 @@ public class UploadService extends Service {
             }
 
             int code = json.optInt("code", httpCode);
+
             if (code != 200) {
                 throw new IOException(
                         "OpenList 分片 " +
@@ -1379,6 +1427,16 @@ public class UploadService extends Service {
         return sb.length() == 0
                 ? e.getClass().getSimpleName()
                 : sb.toString();
+    }
+
+    private static final class ChunkUploadResult {
+        final int index;
+        final int length;
+
+        ChunkUploadResult(int index, int length) {
+            this.index = index;
+            this.length = length;
+        }
     }
 
     private static final class HttpResult {
